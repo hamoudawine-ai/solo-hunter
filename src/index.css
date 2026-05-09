@@ -113,17 +113,6 @@
     text-shadow: 0 0 8px rgba(0, 210, 255, 0.8);
   }
 
-  /* Logout item - always RED */
-  .logout-item:hover span {
-    color: #ef4444 !important;
-    text-shadow: 0 0 8px rgba(239, 68, 68, 0.8);
-  }
-
-  .logout-item::after {
-    background-color: #ef4444 !important;
-    box-shadow: 0 0 15px rgba(239, 68, 68, 0.6), 0 0 30px rgba(239, 68, 68, 0.4) !important;
-  }
-
   .character-info-title {
     @apply text-7xl font-bold tracking-tight uppercase mb-0;
     text-shadow: 0 0 20px var(--system-color), 2px 2px 10px rgba(0, 0, 0, 0.8);

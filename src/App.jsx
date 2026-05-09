@@ -359,6 +359,23 @@ function App() {
   const [systemLogoUrl, setSystemLogoUrl] = useState('system-logo.png');
   const [resolvedThemes, setResolvedThemes] = useState({});
 
+  // Fetch app version from main process
+  useEffect(() => {
+    const fetchVersion = async () => {
+      if (window.electronAPI?.getAppVersion) {
+        try {
+          const versionResult = await window.electronAPI.getAppVersion();
+          if (versionResult?.success) {
+            setAppVersion(versionResult.version);
+          }
+        } catch (error) {
+          console.error('[Version] Failed to fetch app version:', error);
+        }
+      }
+    };
+    fetchVersion();
+  }, []);
+
   useEffect(() => {
     const resolveAssets = async () => {
       if (window.electronAPI?.getResourcePath) {
@@ -434,13 +451,25 @@ function App() {
   const [removingId, setRemovingId] = useState(null)
   const [showTrailer, setShowTrailer] = useState(false)
   const [showDlcs, setShowDlcs] = useState(true)
+  const [onlineFixEnabled, setOnlineFixEnabled] = useState(false)
+  const [comingSoon, setComingSoon] = useState(false)
   const [terminalMessages, setTerminalMessages] = useState([])
   const [isSearching, setIsSearching] = useState(false)
   const [suggestions, setSuggestions] = useState([])
   const [showSuggestions, setShowSuggestions] = useState(false)
   const [showStartupScreen, setShowStartupScreen] = useState(true)
   const [startupStatus, setStartupStatus] = useState('Initializing...')
-  const [updateState, setUpdateState] = useState({ checked: false, available: false, latestVersion: '', currentVersion: '' })
+  const [appVersion, setAppVersion] = useState('3.0.0')
+  const [updateState, setUpdateState] = useState({ 
+    checked: false, 
+    available: false, 
+    latestVersion: '', 
+    currentVersion: '', 
+    downloading: false, 
+    progress: 0, 
+    downloaded: false,
+    checkCompleted: false
+  })
 
   const maxExp = level * 100
   const currentRank = useMemo(() => {
@@ -673,53 +702,95 @@ function App() {
 
   // Search Suggestions Logic
   useEffect(() => {
+    if (!showStartupScreen) return;
+    
+    // Logic to decide when to hide the splash
+    const shouldHide = 
+      updateState.checked && 
+      !updateState.available && 
+      !updateState.downloading && 
+      !updateState.downloaded;
+
+    // Never hide if we are currently downloading
+    if (updateState.downloading) return;
+
+    if (shouldHide) {
+      const timer = setTimeout(() => {
+        setShowStartupScreen(false);
+      }, 1000); 
+      return () => clearTimeout(timer);
+    }
+  }, [showStartupScreen, updateState.checked, updateState.available, updateState.downloading, updateState.downloaded]);
+
+  useEffect(() => {
     let isMounted = true
-    const startedAt = Date.now()
 
     const initStartup = async () => {
       setStartupStatus('Checking for updates...')
 
       try {
+        // Get app version
+        const versionResult = await window.electronAPI?.getAppVersion?.()
+        if (isMounted && versionResult?.success) {
+          setAppVersion(versionResult.version)
+        }
+
         const result = await window.electronAPI?.checkForUpdates?.()
         if (!isMounted) return
 
         if (result?.success && result?.updateAvailable) {
-          setUpdateState({
+          setUpdateState(prev => ({
+            ...prev,
             checked: true,
             available: true,
             latestVersion: result.latestVersion || '',
             currentVersion: result.currentVersion || ''
-          })
-          setStartupStatus(`Update found: v${result.latestVersion}`)
+          }))
+          setStartupStatus('Update required to continue...')
         } else {
-          setUpdateState({
+          setUpdateState(prev => ({
+            ...prev,
             checked: true,
             available: false,
             latestVersion: result?.latestVersion || '',
             currentVersion: result?.currentVersion || ''
-          })
-          setStartupStatus('System up to date. Launching interface...')
+          }))
+          setStartupStatus('System up to date. Ready to launch.')
         }
       } catch (err) {
-        if (!isMounted) return
-        setUpdateState({
-          checked: true,
-          available: false,
-          latestVersion: '',
-          currentVersion: ''
-        })
-        setStartupStatus('Update check unavailable. Launching interface...')
+        console.error('Startup Error:', err)
+        setStartupStatus('System check complete.')
+        setUpdateState(prev => ({ ...prev, checked: true }))
       }
-
-      const elapsed = Date.now() - startedAt
-      const minimumSplashDuration = 2200
-      const waitTime = Math.max(0, minimumSplashDuration - elapsed)
-      setTimeout(() => {
-        if (isMounted) setShowStartupScreen(false)
-      }, waitTime)
     }
 
     initStartup()
+
+    // Setup auto-updater listeners
+    if (window.electronAPI) {
+      window.electronAPI.onUpdateAvailable?.((info) => {
+        console.log('[App] Update available event:', info.version);
+        setUpdateState(prev => ({ ...prev, available: true, latestVersion: info.version, checkCompleted: true }));
+      });
+      window.electronAPI.onUpdateNotAvailable?.((info) => {
+        console.log('[App] Update not available event:', info);
+        setUpdateState(prev => ({ ...prev, available: false, checkCompleted: true }));
+      });
+      window.electronAPI.onUpdateDownloadProgress?.((progress) => {
+        console.log('[App] Download progress:', progress.percent);
+        setUpdateState(prev => ({ ...prev, downloading: true, progress: progress.percent }));
+      });
+      window.electronAPI.onUpdateDownloaded?.(() => {
+        console.log('[App] Update downloaded event');
+        setUpdateState(prev => ({ ...prev, downloading: false, downloaded: true }));
+      });
+      window.electronAPI.onUpdateError?.((err) => {
+        console.error('[App] Update error event:', err);
+        setUpdateState(prev => ({ ...prev, downloading: false, checkCompleted: true }));
+        addNotification(`Update Error: ${err}`, 'error');
+      });
+    }
+
     return () => {
       isMounted = false
     }
@@ -826,6 +897,10 @@ function App() {
         // Don't auto-select DLCs anymore, let the user choose
         setSelectedDlcs(new Set());
         
+        // Reset game-specific settings
+        setOnlineFixEnabled(false);
+        setComingSoon(false);
+        
         // Check if Lua already exists
         if (window.electronAPI?.checkLuaExists) {
           const existsRes = await window.electronAPI.checkLuaExists(appId.toString());
@@ -891,8 +966,8 @@ function App() {
     }
     
     try {
-      // Validate key against backend
-      const validation = await window.electronAPI.validateKey(upperCode)
+      // Validate key against backend, including device binding
+      const validation = await window.electronAPI.validateKey(upperCode, deviceId)
       
       if (!validation.success) {
         setActivationError(true)
@@ -900,7 +975,8 @@ function App() {
         return
       }
       
-      if (!validation.valid) {
+      const isSameDeviceReuse = validation.used && validation.sameDevice
+      if (!validation.valid && !isSameDeviceReuse) {
         if (validation.used) {
           // Key already used on another device
           setDeviceMismatchError(true)
@@ -912,8 +988,10 @@ function App() {
         return
       }
       
-      // Key is valid and unused - mark it as used
-      await window.electronAPI.markKeyUsed(upperCode, deviceId)
+      // Key is valid and unused, or valid because it was previously activated on this same device
+      if (!validation.used) {
+        await window.electronAPI.markKeyUsed(upperCode, deviceId)
+      }
       
       // Activate the system
       setIsActivated(true)
@@ -1102,38 +1180,88 @@ function App() {
           </div>
 
           {/* Simple Progress Bar */}
-          <div className="mt-8 w-64">
-            <div className="h-1 bg-white/10 rounded-full overflow-hidden">
-              <div className="h-full w-2/3 bg-system-blue rounded-full animate-pulse" />
-            </div>
-            <p className="text-[10px] text-white/40 text-center mt-3">{startupStatus}</p>
-          </div>
-
-          {/* Update Status from GitHub */}
-          {updateState.checked && (
-            <div className="mt-4 text-center">
-              {updateState.available ? (
-                <div className="flex items-center gap-2 px-3 py-1.5 bg-yellow-500/10 border border-yellow-500/30 rounded-full">
-                  <div className="w-1.5 h-1.5 bg-yellow-500 rounded-full animate-pulse" />
-                  <span className="text-[9px] text-yellow-400 tracking-widest uppercase">
-                    Update v{updateState.latestVersion} Available
-                  </span>
-                </div>
+          <div className="mt-8 w-64 h-32 flex flex-col items-center justify-start">
+            <div className="w-full h-1 bg-white/10 rounded-full overflow-hidden mb-3">
+              {updateState.downloading ? (
+                <div 
+                  key="update-progress-bar"
+                  className="h-full bg-system-blue shadow-neon transition-all duration-150 ease-linear" 
+                  style={{ width: `${Math.max(2, updateState.progress)}%` }}
+                />
               ) : (
-                <div className="flex items-center gap-2 px-3 py-1.5 bg-green-500/10 border border-green-500/30 rounded-full">
-                  <div className="w-1.5 h-1.5 bg-green-500 rounded-full" />
-                  <span className="text-[9px] text-green-400 tracking-widest uppercase">
-                    System Up To Date
-                  </span>
-                </div>
+                <div className="h-full w-2/3 bg-system-blue rounded-full animate-pulse" />
               )}
             </div>
-          )}
+            
+            <p className="text-[10px] text-white/40 text-center font-mono min-h-[1.5em] mb-4">
+              {updateState.downloading ? (
+                <span className="flex items-center justify-center gap-2 text-system-blue">
+                  <span className="animate-pulse">DOWNLOADING PROTOCOL:</span>
+                  <span className="font-bold w-[40px] inline-block">{Math.round(updateState.progress)}%</span>
+                </span>
+              ) : (
+                <span className="opacity-60">{startupStatus}</span>
+              )}
+            </p>
+
+            {/* Update Actions Area - Persistent Height */}
+            <div className="h-10 flex items-center justify-center">
+              {updateState.checked && (
+                <>
+                  {updateState.downloaded ? (
+                    <button 
+                      onClick={() => window.electronAPI.quitAndInstall()}
+                      className="flex items-center gap-2 px-4 py-2 bg-green-500/10 border border-green-500/30 rounded-full hover:bg-green-500/20 transition-all group shadow-[0_0_15px_rgba(34,197,94,0.2)]"
+                    >
+                      <div className="w-1.5 h-1.5 bg-green-500 rounded-full animate-pulse" />
+                      <span className="text-[10px] text-green-400 font-bold tracking-widest uppercase">
+                        Install Update & Restart
+                      </span>
+                    </button>
+                  ) : updateState.available && !updateState.downloading ? (
+                    <button 
+                      onClick={async (e) => {
+                        e.stopPropagation();
+                        console.log('[App] ⭐ Download button clicked!');
+                        setUpdateState(prev => ({ ...prev, downloading: true, progress: 0 }));
+                        try {
+                            console.log('[App] Calling startDownloadUpdate...');
+                            const res = await window.electronAPI.startDownloadUpdate();
+                            console.log('[App] startDownloadUpdate result:', res);
+                            if (!res.success) {
+                              setUpdateState(prev => ({ ...prev, downloading: false }));
+                              addNotification(`UPDATE FAILED: ${res.reason || 'Unknown error'}`, 'error');
+                            }
+                          } catch (err) {
+                            console.error('[App] startDownloadUpdate error:', err);
+                            setUpdateState(prev => ({ ...prev, downloading: false }));
+                            addNotification(`SYSTEM ERROR: ${err.message}`, 'error');
+                          }
+                      }}
+                      className="flex items-center gap-2 px-4 py-2 bg-yellow-500/10 border border-yellow-500/30 rounded-full hover:bg-yellow-500/20 transition-all group shadow-[0_0_15px_rgba(234,179,8,0.2)]"
+                    >
+                      <div className="w-1.5 h-1.5 bg-green-500 rounded-full animate-pulse group-hover:scale-125 transition-transform" />
+                      <span className="text-[10px] text-yellow-400 font-bold tracking-widest uppercase">
+                        Update v{updateState.latestVersion} Available - Start Download
+                      </span>
+                    </button>
+                  ) : !updateState.available && (
+                    <div className="flex items-center gap-2 px-3 py-1.5 bg-green-500/10 border border-green-500/30 rounded-full opacity-60">
+                      <div className="w-1.5 h-1.5 bg-green-500 rounded-full" />
+                      <span className="text-[9px] text-green-400 tracking-widest uppercase font-bold">
+                        System Up To Date
+                      </span>
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          </div>
 
           {/* Version Info */}
           <div className="absolute bottom-8 left-0 right-0 text-center">
             <p className="text-[9px] text-white/30 tracking-widest uppercase">
-              {updateState.currentVersion ? `v${updateState.currentVersion}` : 'v2.0.4'} • SOLO HUNTER
+              {updateState.currentVersion ? `v${updateState.currentVersion}` : 'v4.0.0'} • SOLO HUNTER
             </p>
           </div>
         </div>
@@ -1447,6 +1575,21 @@ function App() {
                   </div>
                 )}
                 
+                {/* COMING SOON Badge */}
+                {comingSoon && (
+                  <div className="max-w-3xl mb-6">
+                    <div className="bg-amber-500/10 border border-amber-500/30 rounded-xl p-4 flex items-center space-x-3">
+                      <div className="w-10 h-10 rounded-full bg-amber-500/20 flex items-center justify-center">
+                        <span className="text-amber-400 text-lg">⏳</span>
+                      </div>
+                      <div>
+                        <h4 className="text-xs font-bold tracking-widest text-amber-400 uppercase">Coming Soon</h4>
+                        <p className="text-[9px] text-white/40 uppercase tracking-wider">This title is awaiting system integration. Check back later.</p>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
                 {/* SteamDB Style Info Grid */}
                 <div className="grid grid-cols-3 gap-8 py-8 border-y border-white/5 max-w-3xl">
                   <div>
@@ -1459,7 +1602,9 @@ function App() {
                   </div>
                   <div>
                     <p className="text-[9px] text-white/30 uppercase tracking-widest mb-2">Status</p>
-                    <p className="text-xs text-blue-400 font-bold uppercase">Ready</p>
+                    <p className={`text-xs font-bold uppercase ${comingSoon ? 'text-amber-400' : 'text-blue-400'}`}>
+                      {comingSoon ? 'Coming Soon' : 'Ready'}
+                    </p>
                   </div>
                 </div>
 
@@ -1602,6 +1747,18 @@ function App() {
               <a href="#" onClick={(e) => { e.preventDefault(); if(isActivated) { setCurrentView('HOME'); setActiveGameView(null); } }} className={`nav-link ${isActivated && currentView === 'HOME' ? 'text-system-blue font-bold' : isActivated ? '' : 'opacity-20 cursor-not-allowed'}`}>Home</a>
               <a href="#" onClick={(e) => { e.preventDefault(); if(isActivated) { setCurrentView('MY_GAMES'); setActiveGameView(null); } }} className={`nav-link ${isActivated && currentView === 'MY_GAMES' ? 'text-system-blue font-bold' : isActivated ? '' : 'opacity-20 cursor-not-allowed'}`}>My Games</a>
               <a href="#" onClick={(e) => { e.preventDefault(); if(isActivated) addNotification('COMING SOON', 'info'); }} className={`nav-link ${isActivated ? '' : 'opacity-20 cursor-not-allowed'}`}>Denuvo Games</a>
+              
+              <a 
+                href="#" 
+                onClick={(e) => { 
+                  e.preventDefault(); 
+                  if(isActivated) addNotification('COMING SOON - FUTURE UPDATE', 'info'); 
+                }} 
+                className={`nav-link ${isActivated ? '' : 'opacity-20 cursor-not-allowed'}`}
+              >
+                Online Fix
+              </a>
+              
               <a href="#" onClick={(e) => { e.preventDefault(); if(isActivated) setShowHelpModal(true); }} className={`nav-link ${isActivated ? '' : 'opacity-20 cursor-not-allowed'}`}>Help</a>
             </nav>
           </div>
@@ -1646,14 +1803,28 @@ function App() {
                         onClick={() => handleSelectSuggestion(game)}
                         className="w-full flex items-center space-x-4 p-3 hover:bg-white/5 transition-colors text-left group border-b border-white/5 last:border-0"
                       >
-                        <img 
-                          src={game.tiny_image} 
-                          alt="" 
-                          className="w-24 h-11 object-fill rounded shadow-lg border border-white/10 group-hover:border-system-blue/50 transition-colors"
-                        />
+                        <div className="relative">
+                          <img 
+                            src={game.tiny_image} 
+                            alt="" 
+                            className="w-24 h-11 object-fill rounded shadow-lg border border-white/10 group-hover:border-system-blue/50 transition-colors"
+                          />
+                          {/* Coming Soon Badge */}
+                          {game.comingSoon && (
+                            <div className="absolute inset-0 flex items-center justify-center bg-black/60 rounded">
+                              <span className="text-[7px] font-bold text-amber-400 uppercase tracking-wider">Soon</span>
+                            </div>
+                          )}
+                        </div>
                         <div className="flex-1 min-w-0">
                           <p className="text-sm font-bold text-white truncate group-hover:text-system-blue transition-colors uppercase tracking-tight">{game.name}</p>
                         </div>
+                        {/* Coming Soon Tag */}
+                        {game.comingSoon && (
+                          <span className="px-2 py-0.5 bg-amber-500/20 border border-amber-500/30 rounded text-[8px] font-bold text-amber-400 uppercase tracking-wider">
+                            Soon
+                          </span>
+                        )}
                       </button>
                     ))}
                   </div>
@@ -1700,7 +1871,7 @@ function App() {
                 <p className="text-white/70 leading-relaxed tracking-wide text-sm max-w-md">
                   {currentRank.character.desc}
                 </p>
-                <div className="mt-6 flex items-center space-x-4">
+                <div className="mt-6 flex items-center space-x-6">
                   <div className="px-4 py-1 border border-system-blue/30 bg-system-blue/5 rounded text-[10px] font-bold tracking-widest text-system-blue uppercase">
                     LV. {level}
                   </div>
@@ -1844,6 +2015,15 @@ function App() {
                         <div className="absolute top-2 right-2 z-20">
                           <div className={`w-1.5 h-1.5 rounded-full ${game.type === 'added' ? 'bg-purple-500 shadow-[0_0_8px_rgba(168,85,247,0.8)]' : 'bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.8)]'} animate-pulse`} />
                         </div>
+                        
+                        {/* Coming Soon Overlay */}
+                        {game.comingSoon && (
+                          <div className="absolute inset-0 z-20 flex items-center justify-center bg-black/70">
+                            <div className="px-3 py-1.5 bg-amber-500/20 border border-amber-500/40 rounded-full">
+                              <span className="text-[9px] font-bold text-amber-400 uppercase tracking-wider">Coming Soon</span>
+                            </div>
+                          </div>
+                        )}
                       </div>
                       <div 
                         className="p-4 bg-gradient-to-t from-black to-transparent flex-1 flex flex-col justify-between relative cursor-pointer"
@@ -2306,6 +2486,33 @@ function App() {
                     </div>
                   )}
 
+                  <div className="bg-yellow-500/5 border border-yellow-500/10 rounded-2xl p-6 hover:bg-yellow-500/10 transition-all group">
+                    <div className="flex items-center justify-between mb-2">
+                      <div className="flex items-center space-x-3">
+                        <Package className="w-5 h-5 text-yellow-500" />
+                        <h3 className="text-sm font-bold tracking-widest text-yellow-500 uppercase">Update Cache</h3>
+                      </div>
+                    </div>
+                    <button 
+                      onClick={async () => {
+                        try {
+                          const result = await window.electronAPI.clearUpdateCache();
+                          if (result.success) {
+                            addNotification('UPDATE CACHE CLEARED SUCCESSFULLY', 'success');
+                          } else {
+                            addNotification(`CACHE CLEAR FAILED: ${result.error}`, 'error');
+                          }
+                        } catch (error) {
+                          addNotification('ERROR CLEARING CACHE', 'error');
+                        }
+                      }}
+                      className="w-full py-3 border border-yellow-500/20 text-yellow-500 text-[9px] font-bold tracking-[0.3em] uppercase rounded-xl hover:bg-yellow-500 hover:text-black transition-all flex items-center justify-center space-x-2"
+                    >
+                      <RefreshCcw className="w-3 h-3" />
+                      <span>Clear Update Cache</span>
+                    </button>
+                  </div>
+
                   <div className="bg-red-500/5 border border-red-500/10 rounded-2xl p-6 hover:bg-red-500/10 transition-all group">
                     <div className="flex items-center justify-between mb-2">
                       <div className="flex items-center space-x-3">
@@ -2364,6 +2571,10 @@ function App() {
             </div>
           </div>
         )}
+
+        <div className="pointer-events-none fixed left-1/2 bottom-4 z-[110] -translate-x-1/2 rounded-full border border-white/10 bg-black/50 px-3 py-1 text-[9px] uppercase tracking-[0.3em] text-white/70 shadow-[0_0_12px_rgba(0,0,0,0.25)] backdrop-blur-sm">
+          PROTOCOL v{updateState.currentVersion || appVersion}
+        </div>
       </div>
     </div>
   )

@@ -1,9 +1,11 @@
-import { app, BrowserWindow, ipcMain, net, shell } from 'electron';
+import { app, BrowserWindow, ipcMain, net, shell, dialog } from 'electron';
 import { exec } from 'child_process';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
 import DiscordRPC from 'discord-rpc';
+import pkg from 'electron-updater';
+const { autoUpdater } = pkg;
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -26,8 +28,8 @@ ipcMain.handle('get-resource-path', async (event, relativePath) => {
   return getResourcePath(relativePath);
 });
 
-const GITHUB_OWNER = process.env.MONARCH_GITHUB_OWNER || '';
-const GITHUB_REPO = process.env.MONARCH_GITHUB_REPO || '';
+const GITHUB_OWNER = 'hamoudawine-ai';
+const GITHUB_REPO = 'solo-hunter';
 const clientId = '1419813038428520448'; 
 DiscordRPC.register(clientId, process.execPath);
 
@@ -138,8 +140,37 @@ async function clearActivity() {
 // Start RPC initialization
 initDiscordRPC();
 
+let mainWindow = null;
+let windowReady = false;
+const eventBuffer = [];
+let lastUpdateCheckResult = null;
+
+// Helper to send event to renderer with buffering
+function sendToRenderer(channel, ...args) {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    if (windowReady) {
+      mainWindow.webContents.send(channel, ...args);
+    } else {
+      // Buffer the event until window is ready
+      eventBuffer.push({ channel, args });
+      console.log(`[EventBuffer] Buffered event: ${channel}`);
+    }
+  }
+}
+
+// Flush buffered events when window is ready
+function flushEventBuffer() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  
+  console.log(`[EventBuffer] Flushing ${eventBuffer.length} buffered events`);
+  while (eventBuffer.length > 0) {
+    const event = eventBuffer.shift();
+    mainWindow.webContents.send(event.channel, ...event.args);
+  }
+}
+
 function createWindow() {
-  const win = new BrowserWindow({
+  mainWindow = new BrowserWindow({
     width: 1200,
     height: 800,
     backgroundColor: '#000000',
@@ -154,11 +185,76 @@ function createWindow() {
     autoHideMenuBar: true,
   });
 
-  win.loadURL(isDev ? 'http://localhost:5888' : `file://${path.join(__dirname, 'dist/index.html')}`);
+  mainWindow.loadURL(isDev ? 'http://localhost:5888' : `file://${path.join(__dirname, 'dist/index.html')}`);
+
+  // Track when window is ready to receive IPC events
+  mainWindow.webContents.on('did-finish-load', () => {
+    console.log('[Main] Window finished loading, flushing event buffer...');
+    windowReady = true;
+    flushEventBuffer();
+  });
+
+  // Auto-updater configuration inside createWindow to ensure mainWindow is ready
+  if (!isDev) {
+    autoUpdater.autoDownload = false; // Manual download only
+    autoUpdater.logger = console;
+    
+    // Skip signature check for unsigned EXE (no paid certificate)
+    autoUpdater.forceDevUpdateConfig = true;
+    console.log('[AutoUpdater] Signature check disabled for unsigned EXE');
+    
+    // Explicitly set GitHub feed URL
+    autoUpdater.setFeedURL({
+      provider: 'github',
+      owner: 'hamoudawine-ai',
+      repo: 'solo-hunter'
+    });
+    console.log('[AutoUpdater] GitHub feed URL configured');
+
+    autoUpdater.on('checking-for-update', () => {
+      console.log('[AutoUpdater] Checking for update...');
+    });
+
+    autoUpdater.on('update-available', (info) => {
+      console.log('[AutoUpdater] Update available:', info.version);
+      sendToRenderer('update-available', info);
+    });
+
+    autoUpdater.on('update-not-available', (info) => {
+      console.log('[AutoUpdater] Update not available:', info?.version || 'current is latest');
+      sendToRenderer('update-not-available', info);
+    });
+
+    autoUpdater.on('download-progress', (progressObj) => {
+      console.log(`[AutoUpdater] ⬇️ Download progress: ${progressObj.percent}% (${progressObj.transferred}/${progressObj.total} bytes)`);
+      sendToRenderer('update-download-progress', progressObj);
+    });
+
+    autoUpdater.on('update-downloaded', (info) => {
+      console.log('[AutoUpdater] Update downloaded:', info.version);
+      sendToRenderer('update-downloaded', info);
+    });
+
+    autoUpdater.on('error', (err) => {
+      console.error('[AutoUpdater] Error:', err);
+      console.error('[AutoUpdater] Stack:', err.stack);
+      
+      // ALWAYS show error with stack trace for debugging (forceDevUpdateConfig should help)
+      const errorDetails = `Error: ${err.message}\n\nStack:\n${err.stack || 'No stack trace'}\n\nConfig: forceDevUpdateConfig=${autoUpdater.forceDevUpdateConfig}`;
+      
+      dialog.showErrorBox(
+        'Auto-Updater Error - Download Failed',
+        errorDetails
+      );
+      
+      sendToRenderer('update-error', err.message);
+    });
+  }
 }
 
 app.whenReady().then(() => {
   createWindow();
+  
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
@@ -196,88 +292,89 @@ const versionToParts = (version) =>
     .map((part) => (Number.isFinite(part) ? part : 0));
 
 const isVersionNewer = (latest, current) => {
-  const latestParts = versionToParts(latest);
-  const currentParts = versionToParts(current);
-  const length = Math.max(latestParts.length, currentParts.length);
-
-  for (let i = 0; i < length; i += 1) {
-    const l = latestParts[i] || 0;
-    const c = currentParts[i] || 0;
-    if (l > c) return true;
-    if (l < c) return false;
+  try {
+    const latestParts = versionToParts(latest);
+    const currentParts = versionToParts(current);
+    
+    for (let i = 0; i < 3; i++) {
+      const l = latestParts[i] || 0;
+      const c = currentParts[i] || 0;
+      if (l > c) return true;
+      if (l < c) return false;
+    }
+    return false;
+  } catch (e) {
+    return latest !== current;
   }
-  return false;
 };
 
 ipcMain.handle('check-for-updates', async () => {
-  if (!GITHUB_OWNER || !GITHUB_REPO) {
-    return {
-      success: false,
-      updateAvailable: false,
-      reason: 'missing_repo_config',
-      currentVersion: app.getVersion(),
-    };
-  }
+  if (!isDev) {
+    const currentVersion = app.getVersion();
+    let latestVersion = '';
+    let success = false;
+    let error = null;
 
-  const latestReleaseUrl = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/releases/latest`;
-  try {
-    const releaseData = await new Promise((resolve) => {
-      const request = net.request({ method: 'GET', url: latestReleaseUrl });
-      request.setHeader('Accept', 'application/vnd.github+json');
-      request.setHeader('User-Agent', 'SOLO-HUNTER-Updater');
-      let rawBody = '';
-
-      request.on('response', (response) => {
-        response.on('data', (chunk) => {
-          rawBody += chunk.toString();
+    try {
+      // 1. Try GitHub API first (More reliable for tagging)
+      console.log('[UpdateCheck] Fetching latest release from GitHub API...');
+      const latestReleaseUrl = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/releases/latest`;
+      const releaseData = await new Promise((resolve) => {
+        const request = net.request({ method: 'GET', url: latestReleaseUrl });
+        request.setHeader('Accept', 'application/vnd.github+json');
+        request.setHeader('User-Agent', 'SOLO-HUNTER-Updater');
+        let rawBody = '';
+        request.on('response', (response) => {
+          response.on('data', (chunk) => { rawBody += chunk.toString(); });
+          response.on('end', () => {
+            if (response.statusCode !== 200) { resolve(null); return; }
+            try { resolve(JSON.parse(rawBody)); } catch { resolve(null); }
+          });
         });
-        response.on('end', () => {
-          if (response.statusCode !== 200) {
-            resolve(null);
-            return;
-          }
-          try {
-            resolve(JSON.parse(rawBody));
-          } catch {
-            resolve(null);
-          }
-        });
+        request.on('error', () => resolve(null));
+        request.end();
       });
 
-      request.on('error', () => resolve(null));
-      request.end();
-    });
-
-    if (!releaseData?.tag_name) {
-      return {
-        success: false,
-        updateAvailable: false,
-        reason: 'invalid_release_payload',
-        currentVersion: app.getVersion(),
-      };
+      if (releaseData && releaseData.tag_name) {
+        latestVersion = normalizeVersion(releaseData.tag_name);
+        console.log(`[UpdateCheck] GitHub API found version: ${latestVersion}`);
+        success = true;
+      }
+    } catch (err) {
+      console.error('[UpdateCheck] GitHub API error:', err.message);
+      error = err.message;
     }
 
-    const currentVersion = normalizeVersion(app.getVersion());
-    const latestVersion = normalizeVersion(releaseData.tag_name);
-    const updateAvailable = isVersionNewer(latestVersion, currentVersion);
+    try {
+      // 2. Always trigger autoUpdater to sync its internal state for downloading later
+      console.log('[UpdateCheck] Triggering autoUpdater.checkForUpdates()...');
+      const result = await autoUpdater.checkForUpdates();
+      lastUpdateCheckResult = result; // Store globally for download later
+      if (!latestVersion && result?.updateInfo?.version) {
+        latestVersion = result.updateInfo.version;
+        console.log(`[UpdateCheck] autoUpdater found version: ${latestVersion}`);
+        success = true;
+      }
+      console.log('[UpdateCheck] Stored update check result for download:', result?.updateInfo?.version);
+    } catch (err) {
+      console.error('[UpdateCheck] autoUpdater check error:', err.message);
+      lastUpdateCheckResult = null; // Clear on error
+      // Don't fail the whole thing if GitHub API already succeeded
+      if (!success) error = err.message;
+    }
+
+    const updateAvailable = latestVersion && isVersionNewer(latestVersion, currentVersion);
+    console.log(`[UpdateCheck] Final Result - Current: ${currentVersion}, Latest: ${latestVersion}, Available: ${updateAvailable}`);
 
     return {
-      success: true,
-      updateAvailable,
+      success: success || !!latestVersion,
+      updateAvailable: !!updateAvailable,
       currentVersion,
-      latestVersion,
-      releaseName: releaseData.name || '',
-      releaseUrl: releaseData.html_url || '',
-      publishedAt: releaseData.published_at || '',
-    };
-  } catch (error) {
-    return {
-      success: false,
-      updateAvailable: false,
-      reason: error.message,
-      currentVersion: app.getVersion(),
+      latestVersion: latestVersion || currentVersion,
+      error
     };
   }
+  return { success: false, reason: 'is_dev' };
 });
 
 ipcMain.on('window-minimize', () => BrowserWindow.getFocusedWindow()?.minimize());
@@ -287,6 +384,104 @@ ipcMain.on('window-maximize', () => {
   else win?.maximize();
 });
 ipcMain.on('window-close', () => BrowserWindow.getFocusedWindow()?.close());
+
+ipcMain.handle('open-external-url', async (event, url) => {
+  if (url) {
+    shell.openExternal(url);
+    return true;
+  }
+  return false;
+});
+
+ipcMain.handle('start-download-update', async () => {
+  if (!isDev) {
+    console.log('[AutoUpdater] Manual download requested...');
+    console.log('[AutoUpdater] Using stored check result:', lastUpdateCheckResult?.updateInfo?.version);
+    
+    if (!lastUpdateCheckResult?.updateInfo) {
+      console.log('[AutoUpdater] No stored update info, checking now...');
+      try {
+        const checkResult = await autoUpdater.checkForUpdates();
+        lastUpdateCheckResult = checkResult;
+      } catch (err) {
+        console.error('[AutoUpdater] Check failed:', err.message);
+        return { success: false, reason: 'Failed to check for updates: ' + err.message };
+      }
+    }
+    
+    if (!lastUpdateCheckResult?.updateInfo) {
+      console.log('[AutoUpdater] Still no update info available');
+      return { success: false, reason: 'No update available. Please check for updates first.' };
+    }
+    
+    console.log('[AutoUpdater] Update found:', lastUpdateCheckResult.updateInfo.version);
+    
+    // Download the update
+    console.log('[AutoUpdater] ⭐⭐⭐ CALLING downloadUpdate() NOW! ⭐⭐⭐');
+    console.log('[AutoUpdater] Update info before download:', lastUpdateCheckResult.updateInfo);
+    try {
+      await autoUpdater.downloadUpdate();
+      console.log('[AutoUpdater] ✅ downloadUpdate() completed successfully');
+      return { success: true };
+    } catch (downloadErr) {
+      console.error('[AutoUpdater] ❌ downloadUpdate() FAILED:', downloadErr);
+      throw downloadErr;
+    }
+  }
+  return { success: false, reason: 'is_dev' };
+});
+
+ipcMain.handle('quit-and-install', async () => {
+  if (!isDev) {
+    autoUpdater.quitAndInstall();
+    return { success: true };
+  }
+  return { success: false, reason: 'is_dev' };
+});
+
+ipcMain.handle('clear-update-cache', async () => {
+  if (!isDev) {
+    try {
+      // Clear electron-updater cache
+      const userDataPath = app.getPath('userData');
+      const updateCachePath = path.join(userDataPath, 'updates');
+
+      if (fs.existsSync(updateCachePath)) {
+        // Remove all files in the updates directory
+        const files = fs.readdirSync(updateCachePath);
+        for (const file of files) {
+          const filePath = path.join(updateCachePath, file);
+          if (fs.statSync(filePath).isFile()) {
+            fs.unlinkSync(filePath);
+            console.log(`[UpdateCache] Removed cached file: ${file}`);
+          }
+        }
+        console.log('[UpdateCache] Cache cleared successfully');
+      } else {
+        console.log('[UpdateCache] No cache directory found');
+      }
+
+      // Also clear any pending update state
+      lastUpdateCheckResult = null;
+
+      return { success: true, message: 'Update cache cleared' };
+    } catch (error) {
+      console.error('[UpdateCache] Error clearing cache:', error);
+      return { success: false, error: error.message };
+    }
+  }
+  return { success: false, reason: 'is_dev' };
+});
+
+ipcMain.handle('get-app-version', async () => {
+  try {
+    const version = app.getVersion();
+    return { success: true, version };
+  } catch (error) {
+    console.error('[AppVersion] Error getting version:', error);
+    return { success: false, error: error.message };
+  }
+});
 
 ipcMain.on('update-rpc', (event, { details, state, clear }) => {
   if (clear) clearActivity();
@@ -1259,13 +1454,36 @@ ipcMain.handle('generate-key', async () => {
 });
 
 // Validate a license key
-ipcMain.handle('validate-key', async (event, key) => {
+ipcMain.handle('validate-key', async (event, key, deviceId) => {
   try {
     const keys = loadGeneratedKeys();
-    const upperKey = key.toUpperCase();
+    const upperKey = String(key || '').toUpperCase();
+    const normalizedDeviceId = String(deviceId || '').trim();
     
-    // Master key always works (developer key)
+    // Master key acts like a device-bound key
     if (upperKey === 'ARISE-2026') {
+      const keyData = keys[upperKey];
+      if (keyData?.used) {
+        if (normalizedDeviceId && keyData.usedBy === normalizedDeviceId) {
+          return {
+            success: true,
+            valid: true,
+            used: true,
+            sameDevice: true,
+            isMaster: true,
+            message: 'Master key accepted for this device',
+            usedBy: keyData.usedBy,
+          };
+        }
+        return {
+          success: true,
+          valid: false,
+          used: true,
+          isMaster: true,
+          message: 'Master key already activated on another device',
+          usedBy: keyData.usedBy,
+        };
+      }
       return { success: true, valid: true, isMaster: true, message: 'Master key accepted' };
     }
     
@@ -1278,6 +1496,16 @@ ipcMain.handle('validate-key', async (event, key) => {
     
     // Check if already used
     if (keyData.used) {
+      if (normalizedDeviceId && keyData.usedBy === normalizedDeviceId) {
+        return {
+          success: true,
+          valid: true,
+          used: true,
+          sameDevice: true,
+          message: 'Key already activated on this device',
+          usedBy: keyData.usedBy,
+        };
+      }
       return { success: true, valid: false, used: true, message: 'Key already used', usedBy: keyData.usedBy };
     }
     
@@ -1292,22 +1520,40 @@ ipcMain.handle('validate-key', async (event, key) => {
 ipcMain.handle('mark-key-used', async (event, { key, deviceId }) => {
   try {
     const keys = loadGeneratedKeys();
-    const upperKey = key.toUpperCase();
+    const upperKey = String(key || '').toUpperCase();
+    const normalizedDeviceId = String(deviceId || '').trim();
     
-    // Don't mark master key as used in database
+    if (!upperKey) {
+      return { success: false, message: 'Invalid key' };
+    }
+
+    if (!keys[upperKey]) {
+      keys[upperKey] = {
+        createdAt: new Date().toISOString(),
+        used: false,
+        usedBy: null,
+        usedAt: null,
+      };
+    }
+
+    if (keys[upperKey].used) {
+      if (normalizedDeviceId && keys[upperKey].usedBy === normalizedDeviceId) {
+        return { success: true, message: 'Key already bound to this device', isMaster: upperKey === 'ARISE-2026' };
+      }
+      return { success: false, message: 'Key already bound to another device' };
+    }
+
+    keys[upperKey].used = true;
+    keys[upperKey].usedBy = normalizedDeviceId || 'UNKNOWN_DEVICE';
+    keys[upperKey].usedAt = new Date().toISOString();
+    saveGeneratedKeys(keys);
+
     if (upperKey === 'ARISE-2026') {
-      console.log('[Keys] Master key used by device:', deviceId);
+      console.log('[Keys] Master key bound to device:', normalizedDeviceId);
       return { success: true, isMaster: true };
     }
-    
-    if (keys[upperKey]) {
-      keys[upperKey].used = true;
-      keys[upperKey].usedBy = deviceId;
-      keys[upperKey].usedAt = new Date().toISOString();
-      saveGeneratedKeys(keys);
-      console.log('[Keys] Marked as used:', upperKey, 'by device:', deviceId);
-    }
-    
+
+    console.log('[Keys] Marked as used:', upperKey, 'by device:', normalizedDeviceId);
     return { success: true };
   } catch (error) {
     console.error('[Keys] Mark used failed:', error);

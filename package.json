@@ -1,0 +1,60 @@
+{
+  "name": "solo-hunter-system",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "main": "main.js",
+  "scripts": {
+    "dev": "vite --port 5888",
+    "build": "vite build",
+    "preview": "vite preview",
+    "electron": "wait-on http://localhost:5888 && electron .",
+    "start": "concurrently \"npm run dev\" \"npm run electron\"",
+    "package": "npm run build && electron-builder",
+    "dist": "npm run build && electron-builder"
+  },
+  "build": {
+    "appId": "com.solo.hunter.system",
+    "productName": "SOLO HUNTER",
+    "directories": {
+      "output": "dist_electron"
+    },
+    "files": [
+      "dist/**/*",
+      "main.js",
+      "preload.cjs",
+      "package.json",
+      "games.json"
+    ],
+    "win": {
+      "target": "portable",
+      "icon": "public/system-logo.png",
+      "artifactName": "${productName}_v${version}_${arch}.${ext}"
+    },
+    "portable": {
+      "artifactName": "${productName}_v${version}_Portable.${ext}",
+      "unpackDirName": "solo-hunter"
+    },
+    "asar": true
+  },
+  "dependencies": {
+    "discord-rpc": "^4.0.1",
+    "lucide-react": "^0.263.1",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0"
+  },
+  "devDependencies": {
+    "@types/react": "^18.2.15",
+    "@types/react-dom": "^18.2.7",
+    "@vitejs/plugin-react": "^4.0.3",
+    "autoprefixer": "^10.4.14",
+    "concurrently": "^8.2.0",
+    "electron": "^41.5.0",
+    "electron-builder": "^26.8.1",
+    "electron-is-dev": "^2.0.0",
+    "postcss": "^8.4.27",
+    "tailwindcss": "^3.3.3",
+    "vite": "^8.0.10",
+    "wait-on": "^7.0.1"
+  }
+}

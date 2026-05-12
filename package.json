@@ -4,7 +4,19 @@
 
   "private": true,
 
-  "version": "4.0.0",
+  "version": "7.0.12",
+
+  "description": "SOLO HUNTER - Game Verification System",
+
+  "author": "Hamoudawine AI",
+
+  "repository": {
+
+    "type": "git",
+
+    "url": "https://github.com/hamoudawine-ai/solo-hunter.git"
+
+  },
 
   "type": "module",
 
@@ -14,7 +26,9 @@
 
     "dev": "vite --port 5888",
 
-    "build": "vite build",
+    "clean": "node ./scripts/clean-build.js",
+
+    "build": "node prebuild.js && vite build && electron-builder",
 
     "preview": "vite preview",
 
@@ -22,9 +36,19 @@
 
     "start": "concurrently \"npm run dev\" \"npm run electron\"",
 
-    "package": "npm run build && electron-builder",
+    "package": "npm run build",
 
-    "dist": "npm run build && electron-builder"
+    "dist": "npm run build",
+
+    "publish": "node prebuild.js && vite build && electron-builder --publish always",
+
+    "release:patch": "npm version patch --no-git-tag-version && npm run publish",
+
+    "release:minor": "npm version minor --no-git-tag-version && npm run publish",
+
+    "release:major": "npm version major --no-git-tag-version && npm run publish",
+
+    "fix-latest-yml": "node ./scripts/fix-latest-yml.js"
 
   },
 
@@ -54,25 +78,55 @@
 
     ],
 
+    "extraResources": [
+
+      "app-update.yml",
+
+      "public/system-logo.png"
+
+    ],
+
     "win": {
 
-      "target": "portable",
+      "icon": "public/icon.ico",
 
-      "icon": "public/system-logo.png",
+      "target": [
 
-      "artifactName": "${productName}_v${version}_${arch}.${ext}"
+        "zip",
 
-    },
+        "dir"
 
-    "portable": {
+      ],
 
-      "artifactName": "${productName}_v${version}_Portable.${ext}",
-
-      "unpackDirName": "solo-hunter"
+      "artifactName": "SOLO-HUNTER-${version}.${ext}"
 
     },
 
-    "asar": true
+    "asar": true,
+
+    "asarUnpack": [
+
+      "resources/**/*"
+
+    ],
+
+    "afterAllArtifactBuild": "scripts/afterAllArtifactBuild.cjs",
+
+    "publish": [
+
+      {
+
+        "provider": "github",
+
+        "owner": "hamoudawine-ai",
+
+        "repo": "solo-hunter",
+
+        "releaseType": "release"
+
+      }
+
+    ]
 
   },
 
@@ -92,11 +146,13 @@
 
   "devDependencies": {
 
+    "@ljharb/tsconfig": "^0.3.2",
+
     "@types/react": "^18.2.15",
 
     "@types/react-dom": "^18.2.7",
 
-    "@vitejs/plugin-react": "^4.0.3",
+    "@vitejs/plugin-react": "^5.2.0",
 
     "autoprefixer": "^10.4.14",
 
@@ -108,13 +164,21 @@
 
     "electron-is-dev": "^2.0.0",
 
+    "icojs": "^0.23.0",
+
     "postcss": "^8.4.27",
+
+    "sharp": "^0.34.5",
 
     "tailwindcss": "^3.3.3",
 
+    "to-ico": "^1.1.5",
+
     "vite": "^8.0.10",
 
-    "wait-on": "^7.0.1"
+    "wait-on": "^7.0.1",
+
+    "yaml": "^2.8.4"
 
   }
 

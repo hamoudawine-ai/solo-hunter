@@ -1,5 +1,5 @@
 import { app, BrowserWindow, ipcMain, net, shell, dialog } from 'electron';
-import { exec } from 'child_process';
+import { exec, spawn } from 'child_process';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
@@ -10,6 +10,25 @@ const { autoUpdater } = pkg;
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const isDev = !app.isPackaged;
+
+if (process.platform === 'win32') {
+  app.setAppUserModelId('com.solo.hunter.system');
+}
+
+// Single instance lock to prevent multiple processes (production only)
+if (!isDev) {
+  const gotTheLock = app.requestSingleInstanceLock();
+  if (!gotTheLock) {
+    console.log('[App] Another instance is already running, quitting this one.');
+    app.quit();
+    process.exit(0);
+  }
+}
+
+// Disable hardware acceleration to prevent rendering issues
+// NOTE: Disabled temporarily - can cause graphical issues on some systems
+// app.disableHardwareAcceleration();
+console.log('[App] Hardware acceleration enabled (default).');
 
 // Resolve paths correctly for both Dev and Production (ASAR)
 const getResourcePath = (relativePath) => {
@@ -137,13 +156,25 @@ async function clearActivity() {
   rpc.clearActivity().catch(err => console.error('[Discord RPC] Clear Error:', err));
 }
 
-// Start RPC initialization
-initDiscordRPC();
+// Defer RPC initialization to after app is ready (non-blocking)
+let rpcInitDeferred = false;
 
 let mainWindow = null;
 let windowReady = false;
 const eventBuffer = [];
 let lastUpdateCheckResult = null;
+let updateDownloaded = false;
+
+// Register second-instance handler for production mode (when single instance lock is enabled)
+if (!isDev) {
+  app.on('second-instance', () => {
+    console.log('[App] User attempted to launch a second instance, focusing main window.');
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.focus();
+    }
+  });
+}
 
 // Helper to send event to renderer with buffering
 function sendToRenderer(channel, ...args) {
@@ -169,121 +200,62 @@ function flushEventBuffer() {
   }
 }
 
-function createWindow() {
-  mainWindow = new BrowserWindow({
-    width: 1200,
-    height: 800,
-    backgroundColor: '#000000',
-    icon: getResourcePath('public/system-logo.png'),
-    webPreferences: {
-      preload: path.join(__dirname, 'preload.cjs'),
-      nodeIntegration: false,
-      contextIsolation: true,
-      webSecurity: false,
-    },
-    frame: false,
-    autoHideMenuBar: true,
+async function killRunningSoloHunterProcesses() {
+  if (process.platform !== 'win32') return;
+
+  const exeName = path.basename(process.execPath);
+  const currentPid = process.pid;
+  const killCommand = `taskkill /F /FI "IMAGENAME eq ${exeName}" /FI "PID ne ${currentPid}"`;
+
+  return new Promise((resolve) => {
+    exec(killCommand, (error, stdout, stderr) => {
+      if (error) {
+        const stderrText = String(stderr || error.message || '');
+        if (stderrText.includes('No instance') || stderrText.includes('not found')) {
+          console.log('[ProcessKill] No other SOLO HUNTER process found to terminate.');
+          return resolve();
+        }
+        console.warn('[ProcessKill] taskkill returned an error, continuing anyway:', stderrText.trim() || stdout.trim());
+        return resolve();
+      }
+
+      if (stdout) {
+        console.log('[ProcessKill] Killed other SOLO HUNTER process(es):', stdout.trim());
+      }
+      resolve();
+    });
   });
+}
 
-  mainWindow.loadURL(isDev ? 'http://localhost:5888' : `file://${path.join(__dirname, 'dist/index.html')}`);
+function logExecutablePath() {
+  try {
+    const execPath = process.execPath;
+    const downloadPath = path.join(app.getPath('home'), 'Downloads').toLowerCase();
+    const localAppData = app.getPath('localAppData');
+    const userDataPath = app.getPath('userData');
+    const appDataPath = app.getPath('appData');
+    const tempPath = app.getPath('temp');
 
-  // Track when window is ready to receive IPC events
-  mainWindow.webContents.on('did-finish-load', () => {
-    console.log('[Main] Window finished loading, flushing event buffer...');
-    windowReady = true;
-    flushEventBuffer();
-  });
+    console.log('[AutoUpdater] Executable path:', execPath);
+    console.log('[AutoUpdater] AppData path:', appDataPath);
+    console.log('[AutoUpdater] LocalAppData path:', localAppData);
+    console.log('[AutoUpdater] UserData path:', userDataPath);
+    console.log('[AutoUpdater] Temp path:', tempPath);
 
-  // Auto-updater configuration inside createWindow to ensure mainWindow is ready
-  if (!isDev) {
-    autoUpdater.autoDownload = false; // Manual download only
-    autoUpdater.logger = console;
-    
-    // Skip signature check for unsigned EXE (no paid certificate)
-    autoUpdater.forceDevUpdateConfig = true;
-    console.log('[AutoUpdater] Signature check disabled for unsigned EXE');
-    
-    // Explicitly set GitHub feed URL
-    autoUpdater.setFeedURL({
-      provider: 'github',
-      owner: 'hamoudawine-ai',
-      repo: 'solo-hunter'
-    });
-    console.log('[AutoUpdater] GitHub feed URL configured');
-
-    autoUpdater.on('checking-for-update', () => {
-      console.log('[AutoUpdater] Checking for update...');
-    });
-
-    autoUpdater.on('update-available', (info) => {
-      console.log('[AutoUpdater] Update available:', info.version);
-      sendToRenderer('update-available', info);
-    });
-
-    autoUpdater.on('update-not-available', (info) => {
-      console.log('[AutoUpdater] Update not available:', info?.version || 'current is latest');
-      sendToRenderer('update-not-available', info);
-    });
-
-    autoUpdater.on('download-progress', (progressObj) => {
-      console.log(`[AutoUpdater] ⬇️ Download progress: ${progressObj.percent}% (${progressObj.transferred}/${progressObj.total} bytes)`);
-      sendToRenderer('update-download-progress', progressObj);
-    });
-
-    autoUpdater.on('update-downloaded', (info) => {
-      console.log('[AutoUpdater] Update downloaded:', info.version);
-      sendToRenderer('update-downloaded', info);
-    });
-
-    autoUpdater.on('error', (err) => {
-      console.error('[AutoUpdater] Error:', err);
-      console.error('[AutoUpdater] Stack:', err.stack);
-      
-      // ALWAYS show error with stack trace for debugging (forceDevUpdateConfig should help)
-      const errorDetails = `Error: ${err.message}\n\nStack:\n${err.stack || 'No stack trace'}\n\nConfig: forceDevUpdateConfig=${autoUpdater.forceDevUpdateConfig}`;
-      
+    if (execPath.toLowerCase().startsWith(downloadPath)) {
+      console.warn('[AutoUpdater] Warning: app is running from Downloads folder, updates may not install correctly.');
       dialog.showErrorBox(
-        'Auto-Updater Error - Download Failed',
-        errorDetails
+        'Invalid install location',
+        'SOLO HUNTER appears to be running from your Downloads folder. For reliable updates, move the app to AppData/Local or install it in a dedicated application folder.'
       );
-      
-      sendToRenderer('update-error', err.message);
-    });
+    }
+  } catch (err) {
+    console.warn('[AutoUpdater] Could not log executable paths:', err.message);
+    // Continue without logging - this is not critical for app startup
   }
 }
 
-app.whenReady().then(() => {
-  createWindow();
-  
-  app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
-  });
-});
-
-app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') {
-    if (rpc) {
-      rpc.clearActivity().then(() => {
-        rpc.destroy().catch(() => {});
-        app.quit();
-      }).catch(() => {
-        app.quit();
-      });
-    } else {
-      app.quit();
-    }
-  }
-});
-
-app.on('before-quit', async () => {
-  if (rpc) {
-    try {
-      await rpc.clearActivity();
-      await rpc.destroy();
-    } catch (e) {}
-  }
-});
-
+// Version comparison helpers
 const normalizeVersion = (v = '') => v.toString().trim().replace(/^v/i, '');
 const versionToParts = (version) =>
   normalizeVersion(version)
@@ -307,6 +279,229 @@ const isVersionNewer = (latest, current) => {
     return latest !== current;
   }
 };
+
+function createWindow() {
+  const devIconPath = path.join(__dirname, 'public', 'system-logo.ico');
+  const devIconPngPath = path.join(__dirname, 'public', 'system-logo.png');
+  const prodIconPath = path.join(process.resourcesPath, 'public', 'system-logo.ico');
+  const prodIconPngPath = path.join(process.resourcesPath, 'public', 'system-logo.png');
+
+  const windowIcon = isDev
+    ? (fs.existsSync(devIconPath) ? devIconPath : devIconPngPath)
+    : (fs.existsSync(prodIconPath) ? prodIconPath : prodIconPngPath);
+
+  mainWindow = new BrowserWindow({
+    width: 1200,
+    height: 800,
+    backgroundColor: '#000000',
+    icon: windowIcon,
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.cjs'),
+      nodeIntegration: false,
+      contextIsolation: true,
+      webSecurity: false,
+    },
+    frame: false,
+    autoHideMenuBar: true,
+  });
+
+  mainWindow.loadURL(isDev ? 'http://localhost:5888' : `file://${path.join(__dirname, 'dist/index.html')}`);
+
+  // Track when window is ready to receive IPC events
+  mainWindow.webContents.on('did-finish-load', () => {
+    console.log('[Main] Window finished loading, flushing event buffer...');
+    windowReady = true;
+    flushEventBuffer();
+    
+    // Auto-check for updates on startup (after 1 second delay to ensure UI is ready)
+    if (!isDev) {
+      // Check if a previous update was applied
+      const exeDir = path.dirname(process.execPath);
+      const updateStateFile = path.join(exeDir, '.solo-hunter-update-state');
+      
+      try {
+        if (fs.existsSync(updateStateFile)) {
+          const state = JSON.parse(fs.readFileSync(updateStateFile, 'utf8'));
+          if (state.pending === false || app.getVersion() === state.version) {
+            console.log('[Main] Previous update was applied, version:', state.version);
+            fs.unlinkSync(updateStateFile);
+          }
+        }
+      } catch (err) {
+        console.warn('[Main] Could not check update state:', err.message);
+      }
+      
+      setTimeout(() => {
+        console.log('[Main] Auto-checking for updates on startup...');
+        autoUpdater.checkForUpdates().then(result => {
+          console.log('[Main] Startup update check completed:', result?.updateInfo?.version);
+          lastUpdateCheckResult = result;
+          if (result?.updateInfo?.version) {
+            const updateAvailable = isVersionNewer(result.updateInfo.version, app.getVersion());
+            if (updateAvailable) {
+              sendToRenderer('update-available', result.updateInfo);
+            }
+          }
+        }).catch(err => {
+          console.error('[Main] Startup update check error:', err.message);
+        });
+      }, 1000);
+    }
+  });
+
+  // Auto-updater configuration inside createWindow to ensure mainWindow is ready
+  if (!isDev) {
+    autoUpdater.autoDownload = false; // Manual download only
+    autoUpdater.autoInstallOnAppQuit = false; // Force the updater to understand it's a generic ZIP update
+    autoUpdater.logger = console;
+    autoUpdater.channel = 'latest';
+    autoUpdater.allowDowngrade = false;
+    autoUpdater.disableWebInstaller = true; // Force local ZIP instead of web installer
+    autoUpdater.allowPrerelease = false;
+
+    // Configure GitHub feed for ZIP updates
+    if (app.isPackaged) {
+      autoUpdater.setFeedURL({
+        provider: 'github',
+        owner: 'hamoudawine-ai',
+        repo: 'solo-hunter'
+      });
+      
+      // Force ZIP/DIR update handling instead of trying to execute as EXE
+      autoUpdater.forceDevUpdateConfig = false;
+    }
+    console.log('[AutoUpdater] GitHub feed URL configured for ZIP updates');
+
+    autoUpdater.on('checking-for-update', () => {
+      console.log('[AutoUpdater] Checking for update...');
+    });
+
+    autoUpdater.on('update-available', (info) => {
+      console.log('[AutoUpdater] Update available:', info.version);
+      sendToRenderer('update-available', info);
+    });
+
+    autoUpdater.on('update-not-available', (info) => {
+      console.log('[AutoUpdater] Update not available:', info?.version || 'current is latest');
+      sendToRenderer('update-not-available', info);
+    });
+
+    autoUpdater.on('before-quit-for-update', () => {
+      console.log('[AutoUpdater] Installing update and restarting...');
+    });
+
+    autoUpdater.on('download-progress', (progressObj) => {
+      console.log(`[AutoUpdater] ⬇️ Download progress: ${progressObj.percent}% (${progressObj.transferred}/${progressObj.total} bytes)`);
+      sendToRenderer('update-download-progress', progressObj);
+    });
+
+    autoUpdater.on('update-downloaded', (info) => {
+      console.log('[AutoUpdater] Update downloaded, will install on next restart');
+      console.log('[AutoUpdater] Downloaded file info:', info);
+      sendToRenderer('update-ready');
+      
+      // For ZIP updates, manual restart is safer than quitAndInstall()
+      const dialogOpts = {
+        type: 'info',
+        buttons: ['Restart Now', 'Later'],
+        title: 'Application Update',
+        message: 'A new version has been downloaded. Restart the application to apply the updates.',
+        detail: `Version ${info.version} is ready to install.`
+      };
+
+      dialog.showMessageBox(mainWindow, dialogOpts).then((returnValue) => {
+        if (returnValue.response === 0) {
+          // For ZIP updates, app.relaunch() + app.exit() is safer
+          console.log('[AutoUpdater] User chose to restart, relaunching app...');
+          app.relaunch();
+          app.exit(0);
+        }
+      }).catch(err => {
+        console.error('[AutoUpdater] Dialog error:', err);
+      });
+    });
+
+    autoUpdater.on('error', (err) => {
+      console.error('[AutoUpdater] Error:', err);
+      console.error('[AutoUpdater] Stack:', err.stack);
+      
+      // Handle EFTYPE error specifically - file type issue
+      if (err.message && err.message.includes('EFTYPE')) {
+        console.error('[AutoUpdater] EFTYPE Error: Updater tried to execute a non-executable file.');
+        console.error('[AutoUpdater] Ensure ZIP file is being distributed, not EXE.');
+        const errorDetails = `EFTYPE Error - File Type Issue:\n\nThe updater tried to execute a non-executable file. This usually means:\n1. The build is still generating NSIS/EXE instead of ZIP\n2. The latest.yml points to wrong file type\n3. Check dist_electron/ folder for file type\n\nError: ${err.message}`;
+        dialog.showErrorBox('Updater Error - Build Configuration Issue', errorDetails);
+      } else {
+        const errorDetails = `Error: ${err.message}\n\nStack:\n${err.stack || 'No stack trace'}`;
+        dialog.showErrorBox('Auto-Updater Error - Download Failed', errorDetails);
+      }
+      
+      sendToRenderer('update-error', err.message);
+    });
+  }
+}
+
+app.whenReady().then(() => {
+  const tempPath = app.getPath('temp');
+  const tempTestFile = path.join(tempPath, 'solo-hunter-updater-permission-test.tmp');
+  try {
+    fs.writeFileSync(tempTestFile, 'ok', 'utf8');
+    fs.unlinkSync(tempTestFile);
+    console.log('[AutoUpdater] Temp folder write permission confirmed:', tempPath);
+  } catch (err) {
+    console.error('[AutoUpdater] Temp folder write permission failed:', err.message);
+    dialog.showErrorBox('Updater Permission Error', `Cannot write to temp folder:\n${tempPath}\n${err.message}`);
+  }
+
+  logExecutablePath();
+  createWindow();
+  
+  // Initialize Discord RPC asynchronously after window is created (non-blocking)
+  if (!rpcInitDeferred) {
+    rpcInitDeferred = true;
+    setImmediate(() => {
+      console.log('[App] Initializing Discord RPC...');
+      initDiscordRPC();
+    });
+  }
+  
+  app.on('activate', () => {
+    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+  });
+});
+
+app.on('window-all-closed', () => {
+  if (process.platform !== 'darwin') {
+    if (rpc) {
+      rpc.clearActivity().then(() => {
+        rpc.destroy().catch(() => {});
+        app.quit();
+      }).catch(() => {
+        app.quit();
+      });
+    } else {
+      app.quit();
+    }
+  }
+});
+
+app.on('before-quit', async () => {
+  if (!isDev && updateDownloaded) {
+    console.log('[AutoUpdater] App quitting with downloaded update; forcing install on quit.');
+    try {
+      autoUpdater.quitAndInstall(true, true);
+    } catch (err) {
+      console.error('[AutoUpdater] quitAndInstall on quit failed:', err);
+    }
+  }
+
+  if (rpc) {
+    try {
+      await rpc.clearActivity();
+      await rpc.destroy();
+    } catch (e) {}
+  }
+});
 
 ipcMain.handle('check-for-updates', async () => {
   if (!isDev) {
@@ -359,18 +554,23 @@ ipcMain.handle('check-for-updates', async () => {
     } catch (err) {
       console.error('[UpdateCheck] autoUpdater check error:', err.message);
       lastUpdateCheckResult = null; // Clear on error
-      // Don't fail the whole thing if GitHub API already succeeded
       if (!success) error = err.message;
     }
 
-    const updateAvailable = latestVersion && isVersionNewer(latestVersion, currentVersion);
-    console.log(`[UpdateCheck] Final Result - Current: ${currentVersion}, Latest: ${latestVersion}, Available: ${updateAvailable}`);
+    const autoUpdaterVersion = lastUpdateCheckResult?.updateInfo?.version;
+    const updateAvailable = !!autoUpdaterVersion && isVersionNewer(autoUpdaterVersion, currentVersion);
+
+    if (!updateAvailable && latestVersion && isVersionNewer(latestVersion, currentVersion)) {
+      console.warn('[UpdateCheck] GitHub API reports newer version, but autoUpdater did not return updateInfo. Update will not be offered until autoUpdater can download it.');
+    }
+
+    console.log(`[UpdateCheck] Final Result - Current: ${currentVersion}, Latest: ${latestVersion}, autoUpdaterVersion: ${autoUpdaterVersion}, Available: ${updateAvailable}`);
 
     return {
-      success: success || !!latestVersion,
-      updateAvailable: !!updateAvailable,
+      success: updateAvailable,
+      updateAvailable,
       currentVersion,
-      latestVersion: latestVersion || currentVersion,
+      latestVersion: autoUpdaterVersion || latestVersion || currentVersion,
       error
     };
   }
@@ -413,8 +613,18 @@ ipcMain.handle('start-download-update', async () => {
       console.log('[AutoUpdater] Still no update info available');
       return { success: false, reason: 'No update available. Please check for updates first.' };
     }
-    
-    console.log('[AutoUpdater] Update found:', lastUpdateCheckResult.updateInfo.version);
+
+    const currentVersion = app.getVersion();
+    const availableVersion = lastUpdateCheckResult.updateInfo.version;
+    if (!isVersionNewer(availableVersion, currentVersion)) {
+      console.log('[AutoUpdater] Update info is not newer than current version:', {
+        availableVersion,
+        currentVersion
+      });
+      return { success: false, reason: 'No newer update available. Please check for updates first.' };
+    }
+
+    console.log('[AutoUpdater] Update found:', availableVersion);
     
     // Download the update
     console.log('[AutoUpdater] ⭐⭐⭐ CALLING downloadUpdate() NOW! ⭐⭐⭐');
@@ -433,6 +643,10 @@ ipcMain.handle('start-download-update', async () => {
 
 ipcMain.handle('quit-and-install', async () => {
   if (!isDev) {
+    console.log('[AutoUpdater] Quitting and installing NSIS update...');
+    updateDownloaded = false;
+    await killRunningSoloHunterProcesses();
+    // NSIS update - let electron-updater handle installation
     autoUpdater.quitAndInstall();
     return { success: true };
   }

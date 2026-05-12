@@ -400,7 +400,7 @@ function createWindow() {
       console.log('[AutoUpdater] Downloaded file info:', info);
       sendToRenderer('update-ready');
       
-      // For ZIP updates, manual restart is safer than quitAndInstall()
+      // For ZIP updates, manual restart with spawn is more reliable
       const dialogOpts = {
         type: 'info',
         buttons: ['Restart Now', 'Later'],
@@ -411,10 +411,29 @@ function createWindow() {
 
       dialog.showMessageBox(mainWindow, dialogOpts).then((returnValue) => {
         if (returnValue.response === 0) {
-          // For ZIP updates, app.relaunch() + app.exit() is safer
-          console.log('[AutoUpdater] User chose to restart, relaunching app...');
-          app.relaunch();
-          app.exit(0);
+          // For ZIP updates, spawn is more reliable than app.relaunch()
+          console.log('[AutoUpdater] User chose to restart, spawning new process...');
+          
+          try {
+            // Close the update dialog and window
+            if (mainWindow) mainWindow.destroy();
+            
+            // Spawn the app again as a detached process so it survives app exit
+            const execPath = app.getPath('exe');
+            console.log('[AutoUpdater] Spawning new process:', execPath);
+            
+            spawn(execPath, [], {
+              detached: true,
+              stdio: 'ignore'
+            }).unref();
+            
+            // Exit current process
+            console.log('[AutoUpdater] Exiting current process');
+            app.quit();
+          } catch (err) {
+            console.error('[AutoUpdater] Relaunch error:', err);
+            dialog.showErrorBox('Update Error', 'Failed to restart application. Please close and reopen manually.');
+          }
         }
       }).catch(err => {
         console.error('[AutoUpdater] Dialog error:', err);

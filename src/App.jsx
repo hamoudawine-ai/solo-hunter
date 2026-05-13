@@ -201,6 +201,13 @@ function steamGameLogoUrlCandidates(appId) {
   return uniqueUrls
 }
 
+const ONLINE_FIX_ONLY_GAME_TITLES = ['ينابلي', 'ونليني']
+
+function isOnlineFixOnlyGame(game) {
+  if (!game || !game.name) return false
+  return ONLINE_FIX_ONLY_GAME_TITLES.some((title) => game.name.includes(title))
+}
+
 function GameDetailTitleBlock({ game }) {
   const candidates = useMemo(() => steamGameLogoUrlCandidates(game?.id), [game?.id])
   const [logoIx, setLogoIx] = useState(0)
@@ -342,6 +349,7 @@ function DlcImage({ dlcId, gameId }) {
 
 function App() {
   const [searchQuery, setSearchQuery] = useState('')
+  const [showSuggestions, setShowSuggestions] = useState(false)
   // Progress is now stored per key - each key has its own level and exp
   const [level, setLevel] = useState(1)
   const [exp, setExp] = useState(0)
@@ -437,9 +445,11 @@ function App() {
   const [uiTransparency, setUiTransparency] = useState(() => Number(localStorage.getItem('system_ui_transparency')) || 70)
   const [contentAlignment, setContentAlignment] = useState(() => localStorage.getItem('system_content_alignment') || 'left')
   const [isTransitioning, setIsTransitioning] = useState(false)
-  const [currentView, setCurrentView] = useState('HOME') // HOME, MY_GAMES
+  const [currentView, setCurrentView] = useState('HOME') // HOME, MY_GAMES, ONLINE_FIX, ONLINE_FIX
   const [myGames, setMyGames] = useState([])
   const [isLoadingMyGames, setIsLoadingMyGames] = useState(false)
+  const [onlineGames, setOnlineGames] = useState([])
+  const [isLoadingOnlineGames, setIsLoadingOnlineGames] = useState(false)
   const [activeGameView, setActiveGameView] = useState(null)
   const [selectedDlcs, setSelectedDlcs] = useState(new Set())
   const [isInjected, setIsInjected] = useState(false)
@@ -456,20 +466,8 @@ function App() {
   const [terminalMessages, setTerminalMessages] = useState([])
   const [isSearching, setIsSearching] = useState(false)
   const [suggestions, setSuggestions] = useState([])
-  const [showSuggestions, setShowSuggestions] = useState(false)
   const [showStartupScreen, setShowStartupScreen] = useState(true)
-  const [startupStatus, setStartupStatus] = useState('Initializing...')
   const [appVersion, setAppVersion] = useState('3.0.0')
-  const [updateState, setUpdateState] = useState({ 
-    checked: false, 
-    available: false, 
-    latestVersion: '', 
-    currentVersion: '', 
-    downloading: false, 
-    progress: 0, 
-    downloaded: false,
-    checkCompleted: false
-  })
 
   const maxExp = level * 100
   const currentRank = useMemo(() => {
@@ -538,12 +536,28 @@ function App() {
     try {
       const res = await window.electronAPI.getMyGames();
       if (res.success) {
-        setMyGames(res.games);
+        const filteredGames = res.games.filter((game) => !isOnlineFixOnlyGame(game));
+        setMyGames(filteredGames);
       }
     } catch (err) {
       console.error('Failed to fetch my games:', err);
     } finally {
       setIsLoadingMyGames(false);
+    }
+  }, [isActivated]);
+
+  const fetchOnlineGames = useCallback(async () => {
+    if (!isActivated) return;
+    setIsLoadingOnlineGames(true);
+    try {
+      const res = await window.electronAPI.getInstalledGames();
+      if (res.success) {
+        setOnlineGames(res.games);
+      }
+    } catch (err) {
+      console.error('Failed to fetch installed games:', err);
+    } finally {
+      setIsLoadingOnlineGames(false);
     }
   }, [isActivated]);
 
@@ -649,6 +663,13 @@ function App() {
     }
   }, [isActivated, currentView, fetchMyGames]);
 
+  // Separate effect for fetching online games
+  useEffect(() => {
+    if (isActivated && currentView === 'ONLINE_FIX') {
+      fetchOnlineGames();
+    }
+  }, [isActivated, currentView, fetchOnlineGames]);
+
   // Listen for RPC Status
   useEffect(() => {
     if (window.electronAPI?.onRPCStatus) {
@@ -702,94 +723,20 @@ function App() {
 
   // Search Suggestions Logic
   useEffect(() => {
-    if (!showStartupScreen) return;
-    
-    // Logic to decide when to hide the splash
-    const shouldHide = 
-      updateState.checked && 
-      !updateState.available && 
-      !updateState.downloading && 
-      !updateState.downloaded;
-
-    // Never hide if we are currently downloading
-    if (updateState.downloading) return;
-
-    if (shouldHide) {
-      const timer = setTimeout(() => {
-        setShowStartupScreen(false);
-      }, 1000); 
-      return () => clearTimeout(timer);
-    }
-  }, [showStartupScreen, updateState.checked, updateState.available, updateState.downloading, updateState.downloaded]);
-
-  useEffect(() => {
     let isMounted = true
 
-    const initStartup = async () => {
-      setStartupStatus('Checking for updates...')
-
+    const initVersionCheck = async () => {
       try {
-        // Get app version
         const versionResult = await window.electronAPI?.getAppVersion?.()
         if (isMounted && versionResult?.success) {
           setAppVersion(versionResult.version)
         }
-
-        const result = await window.electronAPI?.checkForUpdates?.()
-        if (!isMounted) return
-
-        if (result?.success && result?.updateAvailable) {
-          setUpdateState(prev => ({
-            ...prev,
-            checked: true,
-            available: true,
-            latestVersion: result.latestVersion || '',
-            currentVersion: result.currentVersion || ''
-          }))
-          setStartupStatus('Update required to continue...')
-        } else {
-          setUpdateState(prev => ({
-            ...prev,
-            checked: true,
-            available: false,
-            latestVersion: result?.latestVersion || '',
-            currentVersion: result?.currentVersion || ''
-          }))
-          setStartupStatus('System up to date. Ready to launch.')
-        }
       } catch (err) {
-        console.error('Startup Error:', err)
-        setStartupStatus('System check complete.')
-        setUpdateState(prev => ({ ...prev, checked: true }))
+        console.error('Version check failed:', err)
       }
     }
 
-    initStartup()
-
-    // Setup auto-updater listeners
-    if (window.electronAPI) {
-      window.electronAPI.onUpdateAvailable?.((info) => {
-        console.log('[App] Update available event:', info.version);
-        setUpdateState(prev => ({ ...prev, available: true, latestVersion: info.version, checkCompleted: true }));
-      });
-      window.electronAPI.onUpdateNotAvailable?.((info) => {
-        console.log('[App] Update not available event:', info);
-        setUpdateState(prev => ({ ...prev, available: false, checkCompleted: true }));
-      });
-      window.electronAPI.onUpdateDownloadProgress?.((progress) => {
-        console.log('[App] Download progress:', progress.percent);
-        setUpdateState(prev => ({ ...prev, downloading: true, progress: progress.percent }));
-      });
-      window.electronAPI.onUpdateDownloaded?.(() => {
-        console.log('[App] Update downloaded event');
-        setUpdateState(prev => ({ ...prev, downloading: false, downloaded: true }));
-      });
-      window.electronAPI.onUpdateError?.((err) => {
-        console.error('[App] Update error event:', err);
-        setUpdateState(prev => ({ ...prev, downloading: false, checkCompleted: true }));
-        addNotification(`Update Error: ${err}`, 'error');
-      });
-    }
+    initVersionCheck()
 
     return () => {
       isMounted = false
@@ -1146,19 +1093,132 @@ function App() {
     }
   };
 
+  const isOnlineFixVisible = useMemo(() => {
+    return currentView === 'ONLINE_FIX'
+  }, [currentView])
+
   useEffect(() => {
     if (!activeGameView) {
       setIsInjected(false);
       setInjectionFailed(false);
+      setOnlineFixEnabled(false);
+    } else {
+      // Check if this game has online_fix enabled
+      setOnlineFixEnabled(activeGameView.online_fix || false);
     }
   }, [activeGameView]);
+
+  useEffect(() => {
+    if (activeGameView && currentView !== 'ONLINE_FIX' && isOnlineFixOnlyGame(activeGameView)) {
+      setActiveGameView(null);
+    }
+  }, [currentView, activeGameView]);
+
+  const handleToggleOnlineFix = async () => {
+    if (!activeGameView) return;
+    
+    try {
+      const newState = !onlineFixEnabled;
+      setOnlineFixEnabled(newState);
+      
+      if (newState) {
+        addNotification(`[ONLINE FIX]: Enabling online features for ${activeGameView.name}...`, 'info');
+        setTimeout(() => {
+          addNotification(`[ONLINE FIX]: Online protocol enabled successfully!`, 'success');
+          playSuccessSound();
+        }, 1500);
+      } else {
+        addNotification(`[ONLINE FIX]: Disabling online features for ${activeGameView.name}...`, 'info');
+        setTimeout(() => {
+          addNotification(`[ONLINE FIX]: Online protocol disabled.`, 'success');
+        }, 1500);
+      }
+      
+      // Update the activeGameView with new online_fix status
+      setActiveGameView({
+        ...activeGameView,
+        online_fix: newState
+      });
+      
+      // Also update the game in onlineGames array
+      setOnlineGames(prevGames => 
+        prevGames.map(g => 
+          g.id === activeGameView.id ? { ...g, online_fix: newState } : g
+        )
+      );
+    } catch (err) {
+      addNotification('[ONLINE FIX]: Protocol Error', 'error');
+    }
+  };
+
+  const handleToggleOnlineFixDirect = async (game, e) => {
+    e.stopPropagation(); // Prevent triggering the game selection
+    
+    try {
+      const newState = !game.online_fix;
+      
+      // Update the game in onlineGames array
+      setOnlineGames(prevGames => 
+        prevGames.map(g => 
+          g.id === game.id ? { ...g, online_fix: newState } : g
+        )
+      );
+      
+      if (newState) {
+        addNotification(`[ONLINE FIX]: Enabling online features for ${game.name}...`, 'info');
+        setTimeout(() => {
+          addNotification(`[ONLINE FIX]: Online protocol enabled successfully!`, 'success');
+          playSuccessSound();
+        }, 1500);
+      } else {
+        addNotification(`[ONLINE FIX]: Disabling online features for ${game.name}...`, 'info');
+        setTimeout(() => {
+          addNotification(`[ONLINE FIX]: Online protocol disabled.`, 'success');
+        }, 1500);
+      }
+    } catch (err) {
+      addNotification('[ONLINE FIX]: Protocol Error', 'error');
+    }
+  };
 
   const handleMinimize = () => window.electronAPI?.minimize()
   const handleMaximize = () => window.electronAPI?.maximize()
   const handleClose = () => window.electronAPI?.close()
 
+  useEffect(() => {
+    const timer = setTimeout(() => setShowStartupScreen(false), 3200)
+    return () => clearTimeout(timer)
+  }, [])
+
   return (
     <div className={`relative flex flex-col h-screen bg-black text-white overflow-hidden transition-all duration-500`}>
+      {/* Startup Splash Overlay */}
+      {showStartupScreen && (
+        <div className="startup-splash">
+          <div className="startup-overlay"></div>
+          <div className="startup-stars"></div>
+          <div className="startup-glow"></div>
+          <div className="startup-corner startup-topLeft">SOLO HUNTER</div>
+          <div className="startup-corner startup-topRight">v{appVersion}</div>
+          <div className="startup-corner startup-bottomLeft">SH</div>
+          <div className="startup-corner startup-bottomRight">2026</div>
+          <div className="startup-wave"></div>
+          <div className="startup-wave startup-wave2"></div>
+          <div className="startup-content">
+            <img className="startup-logo" src={systemLogoUrl} alt="logo" />
+            <div className="startup-title">SOLO HUNTER</div>
+            <div className="startup-subtitle">STEAMTOOLS • DENUVO GAMES • ONLINE FIX</div>
+            <div className="startup-loading-text">LOADING</div>
+            <div className="startup-loading">
+              <div className="startup-dot"></div>
+              <div className="startup-dot"></div>
+              <div className="startup-dot"></div>
+              <div className="startup-dot"></div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Deployment Protocol Overlay */}
       {isDeploying && (
         <div className="fixed inset-0 z-[6000] flex flex-col items-center justify-center bg-black/80 backdrop-blur-sm animate-in fade-in duration-500">
@@ -1170,102 +1230,6 @@ function App() {
         </div>
       )}
 
-      {showStartupScreen && (
-        <div className="fixed inset-0 z-[5000] flex flex-col items-center justify-center bg-black">
-          {/* Simple Logo */}
-          <div className="flex flex-col items-center">
-            <img src={systemLogoUrl} alt="System Logo" className="w-20 h-20 mb-6 opacity-90" />
-            <h1 className="text-xl font-bold text-white tracking-[0.3em] uppercase mb-2">SOLO HUNTER</h1>
-            <p className="text-xs text-white/50 tracking-widest uppercase">Initializing system...</p>
-          </div>
-
-          {/* Simple Progress Bar */}
-          <div className="mt-8 w-64 h-32 flex flex-col items-center justify-start">
-            <div className="w-full h-1 bg-white/10 rounded-full overflow-hidden mb-3">
-              {updateState.downloading ? (
-                <div 
-                  key="update-progress-bar"
-                  className="h-full bg-system-blue shadow-neon transition-all duration-150 ease-linear" 
-                  style={{ width: `${Math.max(2, updateState.progress)}%` }}
-                />
-              ) : (
-                <div className="h-full w-2/3 bg-system-blue rounded-full animate-pulse" />
-              )}
-            </div>
-            
-            <p className="text-[10px] text-white/40 text-center font-mono min-h-[1.5em] mb-4">
-              {updateState.downloading ? (
-                <span className="flex items-center justify-center gap-2 text-system-blue">
-                  <span className="animate-pulse">DOWNLOADING PROTOCOL:</span>
-                  <span className="font-bold w-[40px] inline-block">{Math.round(updateState.progress)}%</span>
-                </span>
-              ) : (
-                <span className="opacity-60">{startupStatus}</span>
-              )}
-            </p>
-
-            {/* Update Actions Area - Persistent Height */}
-            <div className="h-10 flex items-center justify-center">
-              {updateState.checked && (
-                <>
-                  {updateState.downloaded ? (
-                    <button 
-                      onClick={() => window.electronAPI.quitAndInstall()}
-                      className="flex items-center gap-2 px-4 py-2 bg-green-500/10 border border-green-500/30 rounded-full hover:bg-green-500/20 transition-all group shadow-[0_0_15px_rgba(34,197,94,0.2)]"
-                    >
-                      <div className="w-1.5 h-1.5 bg-green-500 rounded-full animate-pulse" />
-                      <span className="text-[10px] text-green-400 font-bold tracking-widest uppercase">
-                        Install Update & Restart
-                      </span>
-                    </button>
-                  ) : updateState.available && !updateState.downloading ? (
-                    <button 
-                      onClick={async (e) => {
-                        e.stopPropagation();
-                        console.log('[App] ⭐ Download button clicked!');
-                        setUpdateState(prev => ({ ...prev, downloading: true, progress: 0 }));
-                        try {
-                            console.log('[App] Calling startDownloadUpdate...');
-                            const res = await window.electronAPI.startDownloadUpdate();
-                            console.log('[App] startDownloadUpdate result:', res);
-                            if (!res.success) {
-                              setUpdateState(prev => ({ ...prev, downloading: false }));
-                              addNotification(`UPDATE FAILED: ${res.reason || 'Unknown error'}`, 'error');
-                            }
-                          } catch (err) {
-                            console.error('[App] startDownloadUpdate error:', err);
-                            setUpdateState(prev => ({ ...prev, downloading: false }));
-                            addNotification(`SYSTEM ERROR: ${err.message}`, 'error');
-                          }
-                      }}
-                      className="flex items-center gap-2 px-4 py-2 bg-yellow-500/10 border border-yellow-500/30 rounded-full hover:bg-yellow-500/20 transition-all group shadow-[0_0_15px_rgba(234,179,8,0.2)]"
-                    >
-                      <div className="w-1.5 h-1.5 bg-green-500 rounded-full animate-pulse group-hover:scale-125 transition-transform" />
-                      <span className="text-[10px] text-yellow-400 font-bold tracking-widest uppercase">
-                        Update v{updateState.latestVersion} Available - Start Download
-                      </span>
-                    </button>
-                  ) : !updateState.available && (
-                    <div className="flex items-center gap-2 px-3 py-1.5 bg-green-500/10 border border-green-500/30 rounded-full opacity-60">
-                      <div className="w-1.5 h-1.5 bg-green-500 rounded-full" />
-                      <span className="text-[9px] text-green-400 tracking-widest uppercase font-bold">
-                        System Up To Date
-                      </span>
-                    </div>
-                  )}
-                </>
-              )}
-            </div>
-          </div>
-
-          {/* Version Info */}
-          <div className="absolute bottom-8 left-0 right-0 text-center">
-            <p className="text-[9px] text-white/30 tracking-widest uppercase">
-              {updateState.currentVersion ? `v${updateState.currentVersion}` : 'v4.0.0'} • SOLO HUNTER
-            </p>
-          </div>
-        </div>
-      )}
       {/* Custom Title Bar */}
       <div className={`relative z-[100] flex items-center justify-between h-7 ${level > 30 ? 'bg-purple-900/20' : 'bg-black/90'} select-none drag-region border-b border-white/5`}>
         <div className="flex items-center pl-3 space-x-2 no-drag">
@@ -1407,11 +1371,12 @@ function App() {
 
         {/* Game Detail Loading Overlay */}
         {isGameDetailLoading && (
-          <div className="fixed inset-0 z-[90] flex items-center justify-center bg-black/80 backdrop-blur-md">
-            <div className="text-center">
-              <div className="w-12 h-12 border-4 border-system-blue border-t-transparent rounded-full animate-spin mx-auto"></div>
-              <p className="text-white/60 text-sm mt-4 tracking-wider">LOADING...</p>
-            </div>
+          <div className="fixed inset-0 z-[90] flex items-center justify-center bg-black/90 backdrop-blur-xl">
+            <img
+              src={systemLogoUrl}
+              alt="System Logo"
+              className="w-24 h-24 object-contain opacity-95 animate-pulse"
+            />
           </div>
         )}
 
@@ -1665,6 +1630,30 @@ function App() {
                       <span className="text-xs font-bold">{isRemoving ? 'REMOVING…' : 'REMOVE SHADOW'}</span>
                     </button>
                   ) : null}
+
+                  {isOnlineFixVisible && (
+                    <>
+                      <button 
+                        type="button"
+                        onClick={handleToggleOnlineFix}
+                        className={`${protocolPillBase} h-14 ${
+                          onlineFixEnabled
+                            ? 'border border-green-500/55 bg-green-950/20 text-green-400 hover:border-green-400/80 hover:bg-green-500/15'
+                            : 'border border-orange-500/55 bg-orange-950/20 text-orange-400 hover:border-orange-400/80 hover:bg-orange-500/15'
+                        }`}
+                      >
+                        {onlineFixEnabled ? <Zap className="h-4 w-4 shrink-0" /> : <Zap className="h-4 w-4 shrink-0" />}
+                        <span className="text-xs font-bold">{onlineFixEnabled ? 'DISABLE ONLINE' : 'ENABLE ONLINE'}</span>
+                      </button>
+
+                      {onlineFixEnabled && activeGameView?.onlineFixPath && (
+                        <div className="col-span-2 px-4 py-3 border border-green-500/30 bg-green-950/10 rounded-lg">
+                          <p className="text-[10px] text-green-400/70 font-mono uppercase tracking-wider mb-1">Online Files Location:</p>
+                          <p className="text-xs text-green-300 font-mono break-all leading-relaxed">{activeGameView.onlineFixPath}</p>
+                        </div>
+                      )}
+                    </>
+                  )}
                 </div>
               </div>
             </div>
@@ -1752,9 +1741,9 @@ function App() {
                 href="#" 
                 onClick={(e) => { 
                   e.preventDefault(); 
-                  if(isActivated) addNotification('COMING SOON - FUTURE UPDATE', 'info'); 
+                  if(isActivated) { setCurrentView('ONLINE_FIX'); setActiveGameView(null); } 
                 }} 
-                className={`nav-link ${isActivated ? '' : 'opacity-20 cursor-not-allowed'}`}
+                className={`nav-link ${isActivated && currentView === 'ONLINE_FIX' ? 'text-system-blue font-bold' : isActivated ? '' : 'opacity-20 cursor-not-allowed'}`}
               >
                 Online Fix
               </a>
@@ -1911,9 +1900,9 @@ function App() {
               </nav>
             </div>
           </main>
-        ) : (
+        ) : currentView === 'MY_GAMES' ? (
           /* MY GAMES VIEW */
-          <main className="relative z-10 flex flex-col h-[calc(100vh-120px)] px-12 pb-12 animate-in fade-in zoom-in duration-500">
+          <main className="relative z-10 flex flex-col h-[calc(100vh-120px)] px-12 pb-12 overflow-y-auto animate-in fade-in zoom-in duration-500">
             <div className="flex items-center justify-between mb-8">
               <div>
                 <h2 className="text-4xl font-bold tracking-[0.2em] text-white uppercase italic">MY <span className="text-system-blue">GAMES</span></h2>
@@ -2058,7 +2047,81 @@ function App() {
               )}
             </div>
           </main>
-        )}
+        ) : currentView === 'ONLINE_FIX' ? (
+          /* INSTALLED GAMES VIEW */
+          <main className="relative z-10 flex flex-col h-[calc(100vh-120px)] px-12 pb-12 overflow-y-auto animate-in fade-in zoom-in duration-500">
+            <div className="flex items-center justify-between mb-8">
+              <div>
+                <h2 className="text-4xl font-bold tracking-[0.2em] text-white uppercase italic">ONLINE <span className="text-system-blue">FIX</span></h2>
+                <p className="text-[10px] text-white/40 tracking-[0.5em] uppercase mt-2">Online Fix Candidates: {onlineGames.filter(game => game.online_fix).length} Profiles Indexed</p>
+              </div>
+              <div className="flex items-center space-x-4">
+                <button 
+                  onClick={fetchOnlineGames}
+                  className="px-4 py-2 bg-system-blue/20 hover:bg-system-blue/30 border border-system-blue/50 rounded-lg text-system-blue font-bold tracking-widest uppercase text-xs transition-all hover:shadow-neon"
+                >
+                  Refresh
+                </button>
+              </div>
+            </div>
+            
+            {isLoadingOnlineGames ? (
+              <div className="flex flex-col items-center justify-center h-64 space-y-6">
+                <div className="w-12 h-12 border-4 border-system-blue/30 border-t-system-blue rounded-full animate-spin"></div>
+                <div>
+                  <h3 className="text-xl font-bold text-white/60 uppercase tracking-widest">Scanning Steam Libraries</h3>
+                  <p className="text-sm text-white/40 mt-2">Detecting installed games...</p>
+                </div>
+              </div>
+            ) : onlineGames.length > 0 ? (
+              <div className="grid grid-cols-1 gap-4">
+                {onlineGames.map((game) => (
+                  <div 
+                    key={game.id}
+                    className="relative w-full flex items-center space-x-3 p-3 hover:bg-white/5 transition-colors text-left group border-b border-white/5 last:border-0"
+                  >
+                    <div 
+                      className="flex-1 flex items-center space-x-4 min-w-0 cursor-pointer"
+                      onClick={() => setActiveGameView(game)}
+                    >
+                      <div className="relative">
+                        <img 
+                          src={game.header_image} 
+                          alt="" 
+                          className="w-24 h-11 object-fill rounded shadow-lg border border-white/10 group-hover:border-system-blue/50 transition-colors"
+                        />
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <p className="text-sm font-bold text-white truncate group-hover:text-system-blue transition-colors uppercase tracking-tight">{game.name}</p>
+                      </div>
+                      <span className="text-[8px] text-white/20 font-mono italic">{game.id}</span>
+                    </div>
+
+                    <button
+                      onClick={(e) => handleToggleOnlineFixDirect(game, e)}
+                      className={`flex-shrink-0 px-3 py-1.5 rounded text-[10px] font-bold uppercase tracking-wider transition-all whitespace-nowrap ${
+                        game.online_fix
+                          ? 'border border-green-500/55 bg-green-950/20 text-green-400 hover:border-green-400/80 hover:bg-green-500/15'
+                          : 'border border-orange-500/55 bg-orange-950/20 text-orange-400 hover:border-orange-400/80 hover:bg-orange-500/15'
+                      }`}
+                    >
+                      <Zap className="inline-block w-3 h-3 mr-1" />
+                      {game.online_fix ? 'DISABLE ONLINE' : 'ENABLE ONLINE'}
+                    </button>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="flex flex-col items-center justify-center h-full text-center space-y-6">
+                <ShieldAlert className="w-20 h-20 text-white/10" />
+                <div>
+                  <h3 className="text-xl font-bold text-white/40 uppercase tracking-widest">No Installed Games Found</h3>
+                  <p className="text-sm text-white/20 mt-2">No Steam games detected. Make sure Steam is installed and games are installed.</p>
+                </div>
+              </div>
+            )}
+          </main>
+        ) : null}
 
         {/* Activation Modal */}
         {showActivationModal && (
@@ -2573,7 +2636,7 @@ function App() {
         )}
 
         <div className="pointer-events-none fixed left-1/2 bottom-4 z-[110] -translate-x-1/2 rounded-full border border-white/10 bg-black/50 px-3 py-1 text-[9px] uppercase tracking-[0.3em] text-white/70 shadow-[0_0_12px_rgba(0,0,0,0.25)] backdrop-blur-sm">
-          PROTOCOL v{updateState.currentVersion || appVersion}
+          PROTOCOL v{appVersion}
         </div>
       </div>
     </div>

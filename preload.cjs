@@ -17,6 +17,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   saveSettings: (settings) => ipcRenderer.invoke('save-settings', settings),
   loadSettings: () => ipcRenderer.invoke('load-settings'),
   getMyGames: () => ipcRenderer.invoke('get-my-games'),
+  getInstalledGames: () => ipcRenderer.invoke('get-installed-games'),
   getAppVersion: () => ipcRenderer.invoke('get-app-version'),
   getResourcePath: (relativePath) => ipcRenderer.invoke('get-resource-path', relativePath),
   generateKey: () => ipcRenderer.invoke('generate-key'),

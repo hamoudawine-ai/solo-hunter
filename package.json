@@ -4,7 +4,7 @@
 
   "private": true,
 
-  "version": "7.0.12",
+  "version": "7.0.19",
 
   "description": "SOLO HUNTER - Game Verification System",
 
@@ -28,7 +28,7 @@
 
     "clean": "node ./scripts/clean-build.js",
 
-    "build": "node prebuild.js && vite build && electron-builder",
+    "build": "vite build && electron-builder",
 
     "preview": "vite preview",
 
@@ -40,15 +40,13 @@
 
     "dist": "npm run build",
 
-    "publish": "node prebuild.js && vite build && electron-builder --publish always",
+    "publish": "vite build && electron-builder --win --x64 --publish never && powershell Compress-Archive -Path ./dist_electron/win-unpacked -DestinationPath ./dist_electron/SOLO-HUNTER-7.0.19.zip -Force && powershell Compress-Archive -Path ./dist_electron/SOLO-HUNTER-7.0.19.zip, ./dist_electron/SOLO-HUNTER-Portable.bat -DestinationPath ./dist_electron/SOLO-HUNTER-Portable-7.0.19.zip -Force && powershell -ExecutionPolicy Bypass -File ./upload-release.ps1",
 
     "release:patch": "npm version patch --no-git-tag-version && npm run publish",
 
     "release:minor": "npm version minor --no-git-tag-version && npm run publish",
 
-    "release:major": "npm version major --no-git-tag-version && npm run publish",
-
-    "fix-latest-yml": "node ./scripts/fix-latest-yml.js"
+    "release:major": "npm version major --no-git-tag-version && npm run publish"
 
   },
 
@@ -80,8 +78,6 @@
 
     "extraResources": [
 
-      "app-update.yml",
-
       "public/system-logo.png"
 
     ],
@@ -90,15 +86,33 @@
 
       "icon": "public/icon.ico",
 
-      "target": [
+      "target": "portable",
 
-        "zip",
-
-        "dir"
-
-      ],
+      "defaultArch": "x64",
 
       "artifactName": "SOLO-HUNTER-${version}.${ext}"
+
+    },
+
+    "nsis": {
+
+      "oneClick": false,
+
+      "perMachine": false,
+
+      "allowToChangeInstallationDirectory": true,
+
+      "installerIcon": "public/icon.ico",
+
+      "uninstallerIcon": "public/icon.ico",
+
+      "installerHeaderIcon": "public/icon.ico",
+
+      "createDesktopShortcut": true,
+
+      "createStartMenuShortcut": true,
+
+      "shortcutName": "SOLO HUNTER"
 
     },
 
@@ -110,7 +124,7 @@
 
     ],
 
-    "afterAllArtifactBuild": "scripts/afterAllArtifactBuild.cjs",
+    "afterPack": "scripts/inject-icon.cjs",
 
     "publish": [
 
@@ -134,13 +148,21 @@
 
     "discord-rpc": "^4.0.1",
 
-    "electron-updater": "^6.8.3",
+    "framer-motion": "^12.38.0",
 
-    "lucide-react": "^0.263.1",
+    "gsap": "^3.15.0",
+
+    "howler": "^2.2.4",
+
+    "lucide-react": "^1.14.0",
+
+    "puppeteer": "^24.43.1",
 
     "react": "^18.2.0",
 
-    "react-dom": "^18.2.0"
+    "react-dom": "^18.2.0",
+
+    "three": "^0.184.0"
 
   },
 
@@ -167,6 +189,8 @@
     "icojs": "^0.23.0",
 
     "postcss": "^8.4.27",
+
+    "rcedit": "^2.1.0",
 
     "sharp": "^0.34.5",
 

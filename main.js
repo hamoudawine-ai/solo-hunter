@@ -1,11 +1,73 @@
-import { app, BrowserWindow, ipcMain, net, shell, dialog } from 'electron';
+import { app, BrowserWindow, ipcMain, net, shell, dialog, autoUpdater } from 'electron';
 import { exec, spawn } from 'child_process';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
 import DiscordRPC from 'discord-rpc';
-import pkg from 'electron-updater';
-const { autoUpdater } = pkg;
+
+const GITHUB_OWNER = 'hamoudawine-ai';
+const GITHUB_REPO = 'solo-hunter';
+const UPDATE_USER_AGENT = 'SOLO-HUNTER-Updater';
+
+let downloadedUpdateZipPath = null;
+let latestReleaseInfo = null;
+
+autoUpdater.autoDownload = false;
+
+autoUpdater.on('update-available', (info) => {
+  dialog.showMessageBox({
+    type: 'info',
+    title: 'Update Available',
+    message: `A new version (${info.version}) is out!`,
+    detail: 'Please download the latest version from GitHub to enjoy the new features.',
+    buttons: ['Go to GitHub', 'Later'],
+    defaultId: 0
+  }).then((result) => {
+    if (result.response === 0) {
+      shell.openExternal('https://github.com/hamoudawine-ai/solo-hunter/releases');
+    }
+  });
+});
+
+const createUpdateSwapScript = (zipPath) => {
+  const appDir = path.dirname(process.execPath);
+  const exePath = process.execPath;
+  const scriptName = `solo-hunter-update-${Date.now()}.bat`;
+  const scriptPath = path.join(app.getPath('temp'), scriptName);
+
+  const batContents = [
+    '@echo off',
+    'chcp 65001 >nul',
+    `set "ZIP_PATH=${zipPath}"`,
+    `set "APP_DIR=${appDir}"`,
+    `set "EXE_PATH=${exePath}"`,
+    'echo Stopping SOLO HUNTER... (if still running)',
+    `taskkill /f /im "${path.basename(exePath)}" >nul 2>&1`,
+    'timeout /t 3 /nobreak >nul',
+    'echo Applying update...',
+    `powershell -NoProfile -ExecutionPolicy Bypass -Command "Expand-Archive -LiteralPath '%ZIP_PATH%' -DestinationPath '%APP_DIR%' -Force"`,
+    'timeout /t 1 /nobreak >nul',
+    'echo Launching updated app...',
+    `start "" "%EXE_PATH%"`,
+    'exit /b 0'
+  ].join('\r\n');
+
+  fs.writeFileSync(scriptPath, batContents, 'utf8');
+  return scriptPath;
+};
+
+const launchUpdateSwapScript = (scriptPath) => {
+  try {
+    const child = spawn('cmd.exe', ['/c', 'start', '""', `"${scriptPath}"`], {
+      detached: true,
+      windowsHide: true,
+      stdio: 'ignore'
+    });
+    child.unref();
+  } catch (err) {
+    console.error('[AutoUpdater] Failed to launch update swap script:', err);
+  }
+};
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -47,8 +109,6 @@ ipcMain.handle('get-resource-path', async (event, relativePath) => {
   return getResourcePath(relativePath);
 });
 
-const GITHUB_OWNER = 'hamoudawine-ai';
-const GITHUB_REPO = 'solo-hunter';
 const clientId = '1419813038428520448'; 
 DiscordRPC.register(clientId, process.execPath);
 
@@ -162,8 +222,6 @@ let rpcInitDeferred = false;
 let mainWindow = null;
 let windowReady = false;
 const eventBuffer = [];
-let lastUpdateCheckResult = null;
-let updateDownloaded = false;
 
 // Register second-instance handler for production mode (when single instance lock is enabled)
 if (!isDev) {
@@ -280,6 +338,93 @@ const isVersionNewer = (latest, current) => {
   }
 };
 
+const fetchJson = (url) => new Promise((resolve, reject) => {
+  const request = net.request({ method: 'GET', url });
+  request.setHeader('Accept', 'application/vnd.github+json');
+  request.setHeader('User-Agent', UPDATE_USER_AGENT);
+  let rawBody = '';
+
+  request.on('response', (response) => {
+    response.on('data', (chunk) => { rawBody += chunk.toString(); });
+    response.on('end', () => {
+      if (response.statusCode !== 200) {
+        return reject(new Error(`GitHub API request failed with status ${response.statusCode}`));
+      }
+
+      try {
+        resolve(JSON.parse(rawBody));
+      } catch (err) {
+        reject(new Error('Failed to parse GitHub API response'));}
+    });
+  });
+
+  request.on('error', (err) => reject(err));
+  request.end();
+});
+
+const findGithubZipAsset = (release) => {
+  if (!release?.assets || !Array.isArray(release.assets)) {
+    return null;
+  }
+
+  return release.assets.find((asset) =>
+    typeof asset.name === 'string' && asset.name.toLowerCase().endsWith('.zip') && typeof asset.browser_download_url === 'string'
+  ) || null;
+};
+
+const getLatestRelease = async () => {
+  const releaseUrl = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/releases/latest`;
+  const release = await fetchJson(releaseUrl);
+  if (!release?.tag_name) {
+    throw new Error('Invalid GitHub release metadata');
+  }
+  return release;
+};
+
+const downloadGithubAsset = async (assetUrl, destination) => {
+  await fs.promises.mkdir(path.dirname(destination), { recursive: true });
+
+  return new Promise((resolve, reject) => {
+    const request = net.request({ method: 'GET', url: assetUrl });
+    request.setHeader('Accept', 'application/octet-stream');
+    request.setHeader('User-Agent', UPDATE_USER_AGENT);
+
+    request.on('response', (response) => {
+      if ([301, 302, 307, 308].includes(response.statusCode) && response.headers.location) {
+        return resolve(downloadGithubAsset(response.headers.location, destination));
+      }
+
+      if (response.statusCode !== 200) {
+        return reject(new Error(`Download failed with status ${response.statusCode}`));
+      }
+
+      const totalBytes = Number(response.headers['content-length'] || 0);
+      let downloadedBytes = 0;
+      const fileStream = fs.createWriteStream(destination);
+
+      response.on('data', (chunk) => {
+        downloadedBytes += chunk.length;
+        if (totalBytes > 0) {
+          sendToRenderer('update-download-progress', {
+            percent: Math.round((downloadedBytes / totalBytes) * 100),
+            transferred: downloadedBytes,
+            total: totalBytes
+          });
+        }
+      });
+
+      response.pipe(fileStream);
+
+      fileStream.on('finish', () => resolve(destination));
+      fileStream.on('error', reject);
+      response.on('error', reject);
+    });
+
+    request.on('error', reject);
+    request.end();
+  });
+};
+
 function createWindow() {
   const devIconPath = path.join(__dirname, 'public', 'system-logo.ico');
   const devIconPngPath = path.join(__dirname, 'public', 'system-logo.png');
@@ -312,152 +457,7 @@ function createWindow() {
     console.log('[Main] Window finished loading, flushing event buffer...');
     windowReady = true;
     flushEventBuffer();
-    
-    // Auto-check for updates on startup (after 1 second delay to ensure UI is ready)
-    if (!isDev) {
-      // Check if a previous update was applied
-      const exeDir = path.dirname(process.execPath);
-      const updateStateFile = path.join(exeDir, '.solo-hunter-update-state');
-      
-      try {
-        if (fs.existsSync(updateStateFile)) {
-          const state = JSON.parse(fs.readFileSync(updateStateFile, 'utf8'));
-          if (state.pending === false || app.getVersion() === state.version) {
-            console.log('[Main] Previous update was applied, version:', state.version);
-            fs.unlinkSync(updateStateFile);
-          }
-        }
-      } catch (err) {
-        console.warn('[Main] Could not check update state:', err.message);
-      }
-      
-      setTimeout(() => {
-        console.log('[Main] Auto-checking for updates on startup...');
-        autoUpdater.checkForUpdates().then(result => {
-          console.log('[Main] Startup update check completed:', result?.updateInfo?.version);
-          lastUpdateCheckResult = result;
-          if (result?.updateInfo?.version) {
-            const updateAvailable = isVersionNewer(result.updateInfo.version, app.getVersion());
-            if (updateAvailable) {
-              sendToRenderer('update-available', result.updateInfo);
-            }
-          }
-        }).catch(err => {
-          console.error('[Main] Startup update check error:', err.message);
-        });
-      }, 1000);
-    }
   });
-
-  // Auto-updater configuration inside createWindow to ensure mainWindow is ready
-  if (!isDev) {
-    autoUpdater.autoDownload = false; // Manual download only
-    autoUpdater.autoInstallOnAppQuit = false; // Force the updater to understand it's a generic ZIP update
-    autoUpdater.logger = console;
-    autoUpdater.channel = 'latest';
-    autoUpdater.allowDowngrade = false;
-    autoUpdater.disableWebInstaller = true; // Force local ZIP instead of web installer
-    autoUpdater.allowPrerelease = false;
-
-    // Configure GitHub feed for ZIP updates
-    if (app.isPackaged) {
-      autoUpdater.setFeedURL({
-        provider: 'github',
-        owner: 'hamoudawine-ai',
-        repo: 'solo-hunter'
-      });
-      
-      // Force ZIP/DIR update handling instead of trying to execute as EXE
-      autoUpdater.forceDevUpdateConfig = false;
-    }
-    console.log('[AutoUpdater] GitHub feed URL configured for ZIP updates');
-
-    autoUpdater.on('checking-for-update', () => {
-      console.log('[AutoUpdater] Checking for update...');
-    });
-
-    autoUpdater.on('update-available', (info) => {
-      console.log('[AutoUpdater] Update available:', info.version);
-      sendToRenderer('update-available', info);
-    });
-
-    autoUpdater.on('update-not-available', (info) => {
-      console.log('[AutoUpdater] Update not available:', info?.version || 'current is latest');
-      sendToRenderer('update-not-available', info);
-    });
-
-    autoUpdater.on('before-quit-for-update', () => {
-      console.log('[AutoUpdater] Installing update and restarting...');
-    });
-
-    autoUpdater.on('download-progress', (progressObj) => {
-      console.log(`[AutoUpdater] ⬇️ Download progress: ${progressObj.percent}% (${progressObj.transferred}/${progressObj.total} bytes)`);
-      sendToRenderer('update-download-progress', progressObj);
-    });
-
-    autoUpdater.on('update-downloaded', (info) => {
-      console.log('[AutoUpdater] Update downloaded, will install on next restart');
-      console.log('[AutoUpdater] Downloaded file info:', info);
-      sendToRenderer('update-ready');
-      
-      // For ZIP updates, manual restart with spawn is more reliable
-      const dialogOpts = {
-        type: 'info',
-        buttons: ['Restart Now', 'Later'],
-        title: 'Application Update',
-        message: 'A new version has been downloaded. Restart the application to apply the updates.',
-        detail: `Version ${info.version} is ready to install.`
-      };
-
-      dialog.showMessageBox(mainWindow, dialogOpts).then((returnValue) => {
-        if (returnValue.response === 0) {
-          // For ZIP updates, spawn is more reliable than app.relaunch()
-          console.log('[AutoUpdater] User chose to restart, spawning new process...');
-          
-          try {
-            // Close the update dialog and window
-            if (mainWindow) mainWindow.destroy();
-            
-            // Spawn the app again as a detached process so it survives app exit
-            const execPath = app.getPath('exe');
-            console.log('[AutoUpdater] Spawning new process:', execPath);
-            
-            spawn(execPath, [], {
-              detached: true,
-              stdio: 'ignore'
-            }).unref();
-            
-            // Exit current process
-            console.log('[AutoUpdater] Exiting current process');
-            app.quit();
-          } catch (err) {
-            console.error('[AutoUpdater] Relaunch error:', err);
-            dialog.showErrorBox('Update Error', 'Failed to restart application. Please close and reopen manually.');
-          }
-        }
-      }).catch(err => {
-        console.error('[AutoUpdater] Dialog error:', err);
-      });
-    });
-
-    autoUpdater.on('error', (err) => {
-      console.error('[AutoUpdater] Error:', err);
-      console.error('[AutoUpdater] Stack:', err.stack);
-      
-      // Handle EFTYPE error specifically - file type issue
-      if (err.message && err.message.includes('EFTYPE')) {
-        console.error('[AutoUpdater] EFTYPE Error: Updater tried to execute a non-executable file.');
-        console.error('[AutoUpdater] Ensure ZIP file is being distributed, not EXE.');
-        const errorDetails = `EFTYPE Error - File Type Issue:\n\nThe updater tried to execute a non-executable file. This usually means:\n1. The build is still generating NSIS/EXE instead of ZIP\n2. The latest.yml points to wrong file type\n3. Check dist_electron/ folder for file type\n\nError: ${err.message}`;
-        dialog.showErrorBox('Updater Error - Build Configuration Issue', errorDetails);
-      } else {
-        const errorDetails = `Error: ${err.message}\n\nStack:\n${err.stack || 'No stack trace'}`;
-        dialog.showErrorBox('Auto-Updater Error - Download Failed', errorDetails);
-      }
-      
-      sendToRenderer('update-error', err.message);
-    });
-  }
 }
 
 app.whenReady().then(() => {
@@ -505,15 +505,6 @@ app.on('window-all-closed', () => {
 });
 
 app.on('before-quit', async () => {
-  if (!isDev && updateDownloaded) {
-    console.log('[AutoUpdater] App quitting with downloaded update; forcing install on quit.');
-    try {
-      autoUpdater.quitAndInstall(true, true);
-    } catch (err) {
-      console.error('[AutoUpdater] quitAndInstall on quit failed:', err);
-    }
-  }
-
   if (rpc) {
     try {
       await rpc.clearActivity();
@@ -523,77 +514,49 @@ app.on('before-quit', async () => {
 });
 
 ipcMain.handle('check-for-updates', async () => {
-  if (!isDev) {
-    const currentVersion = app.getVersion();
-    let latestVersion = '';
-    let success = false;
-    let error = null;
+  if (isDev) {
+    return { success: false, reason: 'is_dev' };
+  }
 
-    try {
-      // 1. Try GitHub API first (More reliable for tagging)
-      console.log('[UpdateCheck] Fetching latest release from GitHub API...');
-      const latestReleaseUrl = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/releases/latest`;
-      const releaseData = await new Promise((resolve) => {
-        const request = net.request({ method: 'GET', url: latestReleaseUrl });
-        request.setHeader('Accept', 'application/vnd.github+json');
-        request.setHeader('User-Agent', 'SOLO-HUNTER-Updater');
-        let rawBody = '';
-        request.on('response', (response) => {
-          response.on('data', (chunk) => { rawBody += chunk.toString(); });
-          response.on('end', () => {
-            if (response.statusCode !== 200) { resolve(null); return; }
-            try { resolve(JSON.parse(rawBody)); } catch { resolve(null); }
-          });
-        });
-        request.on('error', () => resolve(null));
-        request.end();
-      });
+  const currentVersion = app.getVersion();
+  try {
+    console.log('[UpdateCheck] Fetching latest release from GitHub API...');
+    const release = await getLatestRelease();
+    latestReleaseInfo = release;
 
-      if (releaseData && releaseData.tag_name) {
-        latestVersion = normalizeVersion(releaseData.tag_name);
-        console.log(`[UpdateCheck] GitHub API found version: ${latestVersion}`);
-        success = true;
-      }
-    } catch (err) {
-      console.error('[UpdateCheck] GitHub API error:', err.message);
-      error = err.message;
+    const latestVersion = normalizeVersion(release.tag_name);
+    const asset = findGithubZipAsset(release);
+    const updateAvailable = isVersionNewer(latestVersion, currentVersion) && Boolean(asset);
+
+    if (updateAvailable) {
+      console.log('[UpdateCheck] Update available:', latestVersion, 'asset:', asset?.name);
+      autoUpdater.emit('update-available', { version: latestVersion });
+      sendToRenderer('update-available', { version: latestVersion, assetName: asset?.name });
+    } else {
+      console.log('[UpdateCheck] No update available. Current version is latest or ZIP asset missing.');
+      sendToRenderer('update-not-available', { version: currentVersion });
     }
-
-    try {
-      // 2. Always trigger autoUpdater to sync its internal state for downloading later
-      console.log('[UpdateCheck] Triggering autoUpdater.checkForUpdates()...');
-      const result = await autoUpdater.checkForUpdates();
-      lastUpdateCheckResult = result; // Store globally for download later
-      if (!latestVersion && result?.updateInfo?.version) {
-        latestVersion = result.updateInfo.version;
-        console.log(`[UpdateCheck] autoUpdater found version: ${latestVersion}`);
-        success = true;
-      }
-      console.log('[UpdateCheck] Stored update check result for download:', result?.updateInfo?.version);
-    } catch (err) {
-      console.error('[UpdateCheck] autoUpdater check error:', err.message);
-      lastUpdateCheckResult = null; // Clear on error
-      if (!success) error = err.message;
-    }
-
-    const autoUpdaterVersion = lastUpdateCheckResult?.updateInfo?.version;
-    const updateAvailable = !!autoUpdaterVersion && isVersionNewer(autoUpdaterVersion, currentVersion);
-
-    if (!updateAvailable && latestVersion && isVersionNewer(latestVersion, currentVersion)) {
-      console.warn('[UpdateCheck] GitHub API reports newer version, but autoUpdater did not return updateInfo. Update will not be offered until autoUpdater can download it.');
-    }
-
-    console.log(`[UpdateCheck] Final Result - Current: ${currentVersion}, Latest: ${latestVersion}, autoUpdaterVersion: ${autoUpdaterVersion}, Available: ${updateAvailable}`);
 
     return {
-      success: updateAvailable,
+      success: true,
       updateAvailable,
       currentVersion,
-      latestVersion: autoUpdaterVersion || latestVersion || currentVersion,
-      error
+      latestVersion: latestVersion || currentVersion,
+      assetName: asset?.name || null,
+      assetUrl: asset?.browser_download_url || null,
+      error: asset ? null : 'No ZIP asset found in the latest release'
+    };
+  } catch (err) {
+    console.error('[UpdateCheck] Failed to fetch release info:', err.message);
+    sendToRenderer('update-error', err.message);
+    return {
+      success: false,
+      updateAvailable: false,
+      currentVersion,
+      latestVersion: currentVersion,
+      error: err.message
     };
   }
-  return { success: false, reason: 'is_dev' };
 });
 
 ipcMain.on('window-minimize', () => BrowserWindow.getFocusedWindow()?.minimize());
@@ -613,60 +576,59 @@ ipcMain.handle('open-external-url', async (event, url) => {
 });
 
 ipcMain.handle('start-download-update', async () => {
-  if (!isDev) {
-    console.log('[AutoUpdater] Manual download requested...');
-    console.log('[AutoUpdater] Using stored check result:', lastUpdateCheckResult?.updateInfo?.version);
-    
-    if (!lastUpdateCheckResult?.updateInfo) {
-      console.log('[AutoUpdater] No stored update info, checking now...');
-      try {
-        const checkResult = await autoUpdater.checkForUpdates();
-        lastUpdateCheckResult = checkResult;
-      } catch (err) {
-        console.error('[AutoUpdater] Check failed:', err.message);
-        return { success: false, reason: 'Failed to check for updates: ' + err.message };
-      }
-    }
-    
-    if (!lastUpdateCheckResult?.updateInfo) {
-      console.log('[AutoUpdater] Still no update info available');
-      return { success: false, reason: 'No update available. Please check for updates first.' };
+  if (isDev) {
+    return { success: false, reason: 'is_dev' };
+  }
+
+  try {
+    if (!latestReleaseInfo) {
+      latestReleaseInfo = await getLatestRelease();
     }
 
     const currentVersion = app.getVersion();
-    const availableVersion = lastUpdateCheckResult.updateInfo.version;
-    if (!isVersionNewer(availableVersion, currentVersion)) {
-      console.log('[AutoUpdater] Update info is not newer than current version:', {
-        availableVersion,
-        currentVersion
-      });
-      return { success: false, reason: 'No newer update available. Please check for updates first.' };
+    const latestVersion = normalizeVersion(latestReleaseInfo.tag_name);
+    const asset = findGithubZipAsset(latestReleaseInfo);
+
+    if (!asset) {
+      console.error('[UpdateDownload] No ZIP asset available in latest release');
+      return { success: false, reason: 'No ZIP asset available in latest release' };
     }
 
-    console.log('[AutoUpdater] Update found:', availableVersion);
-    
-    // Download the update
-    console.log('[AutoUpdater] ⭐⭐⭐ CALLING downloadUpdate() NOW! ⭐⭐⭐');
-    console.log('[AutoUpdater] Update info before download:', lastUpdateCheckResult.updateInfo);
-    try {
-      await autoUpdater.downloadUpdate();
-      console.log('[AutoUpdater] ✅ downloadUpdate() completed successfully');
-      return { success: true };
-    } catch (downloadErr) {
-      console.error('[AutoUpdater] ❌ downloadUpdate() FAILED:', downloadErr);
-      throw downloadErr;
+    if (!isVersionNewer(latestVersion, currentVersion)) {
+      console.log('[UpdateDownload] Latest release is not newer than current version:', {
+        latestVersion,
+        currentVersion
+      });
+      return { success: false, reason: 'No newer update available' };
     }
+
+    const downloadDir = path.join(app.getPath('temp'), 'solo-hunter-update');
+    const downloadPath = path.join(downloadDir, asset.name);
+    console.log('[UpdateDownload] Downloading update asset:', asset.name);
+
+    const downloadedPath = await downloadGithubAsset(asset.browser_download_url, downloadPath);
+    downloadedUpdateZipPath = downloadedPath;
+    sendToRenderer('update-downloaded', { version: latestVersion, filePath: downloadedPath });
+
+    console.log('[UpdateDownload] Download completed:', downloadedPath);
+    return { success: true, filePath: downloadedPath };
+  } catch (err) {
+    console.error('[UpdateDownload] Failed to download update:', err.message);
+    sendToRenderer('update-error', err.message);
+    return { success: false, reason: err.message };
   }
-  return { success: false, reason: 'is_dev' };
 });
 
 ipcMain.handle('quit-and-install', async () => {
   if (!isDev) {
-    console.log('[AutoUpdater] Quitting and installing NSIS update...');
-    updateDownloaded = false;
-    await killRunningSoloHunterProcesses();
-    // NSIS update - let electron-updater handle installation
-    autoUpdater.quitAndInstall();
+    if (!downloadedUpdateZipPath) {
+      return { success: false, reason: 'No downloaded update found.' };
+    }
+
+    console.log('[AutoUpdater] Launching custom ZIP update swap script...');
+    const scriptPath = createUpdateSwapScript(downloadedUpdateZipPath);
+    launchUpdateSwapScript(scriptPath);
+    app.quit();
     return { success: true };
   }
   return { success: false, reason: 'is_dev' };
@@ -675,27 +637,17 @@ ipcMain.handle('quit-and-install', async () => {
 ipcMain.handle('clear-update-cache', async () => {
   if (!isDev) {
     try {
-      // Clear electron-updater cache
-      const userDataPath = app.getPath('userData');
-      const updateCachePath = path.join(userDataPath, 'updates');
+      const updateTempPath = path.join(app.getPath('temp'), 'solo-hunter-update');
 
-      if (fs.existsSync(updateCachePath)) {
-        // Remove all files in the updates directory
-        const files = fs.readdirSync(updateCachePath);
-        for (const file of files) {
-          const filePath = path.join(updateCachePath, file);
-          if (fs.statSync(filePath).isFile()) {
-            fs.unlinkSync(filePath);
-            console.log(`[UpdateCache] Removed cached file: ${file}`);
-          }
-        }
-        console.log('[UpdateCache] Cache cleared successfully');
+      if (fs.existsSync(updateTempPath)) {
+        fs.rmSync(updateTempPath, { recursive: true, force: true });
+        console.log('[UpdateCache] Update temp folder cleared:', updateTempPath);
       } else {
-        console.log('[UpdateCache] No cache directory found');
+        console.log('[UpdateCache] No update temp folder found');
       }
 
-      // Also clear any pending update state
-      lastUpdateCheckResult = null;
+      latestReleaseInfo = null;
+      downloadedUpdateZipPath = null;
 
       return { success: true, message: 'Update cache cleared' };
     } catch (error) {
@@ -1604,6 +1556,120 @@ ipcMain.handle('get-my-games', async () => {
     return { success: true, games: myGames };
   } catch (error) {
     console.error('[System] Failed to retrieve My Games:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('get-installed-games', async () => {
+  const steamBase = getSteamPath();
+  const steamAppsDir = path.join(steamBase, 'steamapps');
+  const installedGames = [];
+
+  console.log(`[System] Scanning for Installed Steam Games...`);
+
+  try {
+    // Get Installed Steam Games from ALL libraries
+    const libraries = [steamAppsDir];
+    const libraryFoldersPath = path.join(steamAppsDir, 'libraryfolders.vdf');
+    
+    if (fs.existsSync(libraryFoldersPath)) {
+      const content = fs.readFileSync(libraryFoldersPath, 'utf-8');
+      const pathRegex = /"path"\s+"([^"]+)"/g;
+      let match;
+      while ((match = pathRegex.exec(content)) !== null) {
+        const libPath = match[1].replace(/\\\\/g, '\\');
+        const fullLibPath = path.join(libPath, 'steamapps');
+        if (fs.existsSync(fullLibPath) && !libraries.includes(fullLibPath)) {
+          libraries.push(fullLibPath);
+        }
+      }
+    }
+
+    // Process libraries in parallel for faster scanning
+    const libraryPromises = libraries.map(async (lib) => {
+      const libGames = [];
+      if (fs.existsSync(lib)) {
+        const files = fs.readdirSync(lib);
+        const manifestFiles = files.filter(file => file.startsWith('appmanifest_') && file.endsWith('.acf'));
+        
+        for (const file of manifestFiles) {
+          const appId = file.replace('appmanifest_', '').replace('.acf', '');
+          
+          let name = `Steam Game (${appId})`;
+          let installDir = '';
+          try {
+            const acfContent = fs.readFileSync(path.join(lib, file), 'utf-8');
+            const nameMatch = acfContent.match(/"name"\s+"([^"]+)"/);
+            if (nameMatch) name = nameMatch[1];
+            
+            // Get installation directory from .acf file
+            const installDirMatch = acfContent.match(/"installdir"\s+"([^"]+)"/);
+            if (installDirMatch) installDir = installDirMatch[1];
+          } catch (e) {}
+
+          let gameInfo = remoteGameDB[appId] || metadataCache[appId] || {};
+          
+          // If name is still generic, try background fetch
+          if (name.includes('Steam Game') && !gameInfo.name && !metadataCache[appId]) {
+            try {
+              const detailsUrl = `https://store.steampowered.com/api/appdetails?appids=${appId}&l=english`;
+              const detailsResponse = await new Promise((resolve) => {
+                const request = net.request(detailsUrl);
+                request.on('response', (response) => {
+                  let data = '';
+                  response.on('data', (chunk) => { data += chunk; });
+                  response.on('end', () => {
+                    try { resolve(JSON.parse(data)); } catch(e) { resolve(null); }
+                  });
+                });
+                request.on('error', () => resolve(null));
+                request.end();
+              });
+
+              if (detailsResponse?.[appId]?.success) {
+                const data = detailsResponse[appId].data;
+                metadataCache[appId] = {
+                  name: data.name,
+                  header_image: data.header_image
+                };
+                gameInfo = metadataCache[appId];
+              }
+            } catch (e) {}
+          }
+
+          // Construct full game path
+          const gamePath = installDir ? path.join(lib, 'common', installDir) : path.join(lib, 'common', name);
+          const onlineFixPath = path.join(gamePath, 'Online');
+
+          libGames.push({
+            id: appId,
+            name: gameInfo.name || name,
+            header_image: gameInfo.header_image || `https://cdn.cloudflare.steamstatic.com/steam/apps/${appId}/header.jpg`,
+            capsule_image: `https://cdn.cloudflare.steamstatic.com/steam/apps/${appId}/capsule_616x353.jpg`,
+            library_image: `https://cdn.cloudflare.steamstatic.com/steam/apps/${appId}/library_hero.jpg`,
+            type: 'steam',
+            online_fix: false, // افتراضياً للألعاب المثبتة
+            gamePath: gamePath,
+            onlineFixPath: onlineFixPath
+          });
+        }
+      }
+      return libGames;
+    });
+
+    const libraryResults = await Promise.all(libraryPromises);
+    libraryResults.forEach(libGames => {
+      libGames.forEach(game => {
+        if (!installedGames.find(g => g.id === game.id)) {
+          installedGames.push(game);
+        }
+      });
+    });
+
+    console.log(`[System] Total installed games indexed: ${installedGames.length}`);
+    return { success: true, games: installedGames };
+  } catch (error) {
+    console.error('[System] Failed to retrieve Installed Games:', error);
     return { success: false, error: error.message };
   }
 });
